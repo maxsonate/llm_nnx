@@ -1,11 +1,15 @@
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import flax.linen as nn
+from flax import nnx
 import jax.lax as lax
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
+Shape = Sequence[int]
+Dtype = Any
 
 @struct.dataclass
 class TransformerConfig:
@@ -77,3 +81,81 @@ def sinusoidal_init(max_len=2048, min_scale=1.0, max_scale=10000.0):
     return jnp.array(pe)
 
   return init
+
+
+
+class AddPositionEmbs(nnx.Module):
+  """Adds (optionally learned) positional embeddings to the inputs.
+
+  Args:
+    config: TransformerConfig dataclass containing hyperparameters.
+  """
+
+  def __init__(
+    self,
+    config: TransformerConfig,
+    *,
+    decode: bool = False,
+    rngs: nnx.Rngs,
+  ):
+    self.config = config
+    self.decode = decode
+    self.pos_emb_shape = (1, config.max_len, config.emb_dim)
+
+    if config.posemb_init is not None:
+      self.pos_embedding = nnx.Param(
+        config.posemb_init(rngs.params(), self.pos_emb_shape)
+      )
+    else:
+      self.pos_embedding = None
+
+  def __call__(self, inputs: jax.Array, inputs_positions=None):
+    """Applies AddPositionEmbs module.
+
+    By default this layer uses a fixed sinusoidal embedding table. If a
+    learned position embedding is desired, pass an initializer to
+    posemb_init in the configuration.
+
+    Args:
+      inputs: input data.
+      inputs_positions: input position indices for packed sequences.
+
+    Returns:
+      output: `(bs, timesteps, in_dim)`
+    """
+    config = self.config
+    # inputs.shape is (batch_size, seq_len, emb_dim)
+    assert inputs.ndim == 3, (
+      'Number of dimensions should be 3, but it is: %d' % inputs.ndim
+    )
+    length = inputs.shape[1]
+
+    if self.pos_embedding is None:
+      # Use a fixed (non-learned) sinusoidal position embedding.
+      pos_embedding = sinusoidal_init(max_len=config.max_len)(
+        None, self.pos_emb_shape
+      )
+    else:
+      pos_embedding = self.pos_embedding.value
+
+    # We use a cache position index for tracking decoding position.
+    if self.decode:
+      _, _, df = pos_embedding.shape
+      # equivalent to pos_embedding[:, i:i+1] but traceable
+      pos_embedding = lax.dynamic_slice(
+        pos_embedding, jnp.array((0, self.cache_index.value, 0)), (1, 1, df)
+      )
+      self.cache_index.value += 1
+    else:
+      pos_embedding = pos_embedding[:, :length, :]
+
+    if inputs_positions is None:
+      # normal unpacked case:
+      return inputs + pos_embedding
+    else:
+      # for packed data we need to use known position indices:
+      return inputs + jnp.take(pos_embedding[0], inputs_positions, axis=0)
+
+  def init_cache(self, input_shape: Shape, dtype: Dtype = jnp.float32):
+    self.cache_index = nnx.Cache(jnp.array(0, dtype=jnp.uint32))
+

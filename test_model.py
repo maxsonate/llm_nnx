@@ -1,10 +1,14 @@
 import unittest
-import numpy as np
+import jax # Added for jax.random.key
 import jax.numpy as jnp
-from jax import random
+import numpy as np # Kept for existing tests
+from flax import nnx # For new tests
 
-# Assuming model.py is in the same directory or accessible in PYTHONPATH
-from model import shift_right, shift_inputs, sinusoidal_init, TransformerConfig # Added TransformerConfig as it's used by sinusoidal_init indirectly via default posemb_init
+# Consolidated and corrected model imports
+from llm_nnx.model import (
+    shift_right, shift_inputs, sinusoidal_init, 
+    TransformerConfig, AddPositionEmbs, Shape
+)
 
 class TestModelFunctions(unittest.TestCase):
 
@@ -55,7 +59,7 @@ class TestModelFunctions(unittest.TestCase):
     def test_sinusoidal_init(self):
         max_len = 50
         d_feature = 128
-        key = random.PRNGKey(0) # JAX needs a key for random ops, though not strictly used by this init
+        key = jax.random.PRNGKey(0) # JAX needs a key for random ops, though not strictly used by this init
 
         # Get the initializer function
         init_fn = sinusoidal_init(max_len=max_len)
@@ -80,6 +84,82 @@ class TestModelFunctions(unittest.TestCase):
         pos_emb_odd = init_fn(key, shape_odd) # init_fn is for a fixed max_len, but d_feature comes from shape
         self.assertEqual(pos_emb_odd.shape, shape_odd)
         self.assertFalse(jnp.all(pos_emb_odd == 0))
+
+class TestAddPositionEmbs(unittest.TestCase):
+
+    def setUp(self):
+        self.config = TransformerConfig(
+            vocab_size=100,
+            output_vocab_size=100,
+            emb_dim=8,
+            max_len=10,
+            num_heads=2,
+            num_layers=1,
+            qkv_dim=8,
+            mlp_dim=16,
+            dropout_rate=0.0,
+            attention_dropout_rate=0.0,
+            deterministic=True,
+            decode=False
+        )
+        # Use jax.random directly as flax.nnx.Rngs expects jax.random.PRNGKey
+        self.rngs = nnx.Rngs(params=jax.random.key(0), dropout=jax.random.key(1))
+
+    def test_unpacked_sinusoidal(self):
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len, self.config.emb_dim))
+        module = AddPositionEmbs(config=self.config, rngs=self.rngs)
+        outputs = module(inputs)
+        self.assertEqual(outputs.shape, inputs.shape)
+        self.assertFalse(jnp.array_equal(outputs, inputs))
+        expected_sin_emb = sinusoidal_init(max_len=self.config.max_len)(None, (1, self.config.max_len, self.config.emb_dim))[:, :seq_len, :]
+        self.assertTrue(jnp.allclose(outputs, inputs + expected_sin_emb, atol=1e-6))
+
+    def test_unpacked_learned(self):
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len, self.config.emb_dim))
+        init_fn = lambda rng, shape: jax.random.normal(rng, shape) * 0.1
+        config = self.config.replace(posemb_init=init_fn)
+        module = AddPositionEmbs(config=config, rngs=self.rngs)
+        outputs = module(inputs)
+        self.assertEqual(outputs.shape, inputs.shape)
+        self.assertFalse(jnp.array_equal(outputs, inputs))
+        learned_emb = module.pos_embedding.value[:, :seq_len, :]
+        self.assertTrue(jnp.allclose(outputs, inputs + learned_emb, atol=1e-6))
+
+    def test_packed_learned(self):
+        batch_size, packed_len, emb_dim = 1, 7, self.config.emb_dim
+        inputs = jnp.arange(batch_size * packed_len * emb_dim, dtype=jnp.float32).reshape((batch_size, packed_len, emb_dim))
+        positions = jnp.array([[0,1,2,0,1,2,3]])
+        init_fn = lambda rng, shape: (jax.random.normal(rng, shape) * 0.01) + jnp.arange(shape[1], dtype=jnp.float32).reshape(1, -1, 1)
+        config = self.config.replace(posemb_init=init_fn)
+        module = AddPositionEmbs(config=config, rngs=self.rngs)
+        outputs = module(inputs, inputs_positions=positions)
+        self.assertEqual(outputs.shape, inputs.shape)
+        gathered_emb = jnp.take(module.pos_embedding.value[0], positions[0], axis=0)[None, ...]
+        self.assertTrue(jnp.allclose(outputs, inputs + gathered_emb, atol=1e-5))
+
+    def test_decode_mode_learned(self):
+        batch_size, seq_len, emb_dim = 1, 1, self.config.emb_dim
+        inputs = jnp.ones((batch_size, seq_len, emb_dim))
+        init_fn = lambda rng, shape: jax.random.normal(rng, shape) * 0.1
+        config = self.config.replace(posemb_init=init_fn, decode=True)
+        module = AddPositionEmbs(config=config, decode=True, rngs=self.rngs)
+        module.init_cache(input_shape=inputs.shape)
+        
+        for i in range(2):
+            current_idx = module.cache_index.value
+            outputs = module(inputs * (i + 1))
+            self.assertEqual(module.cache_index.value, current_idx + 1)
+            expected_emb = module.pos_embedding.value[:, current_idx:current_idx+1, :]
+            self.assertTrue(jnp.allclose(outputs, inputs * (i+1) + expected_emb, atol=1e-6))
+
+    def test_init_cache(self):
+        module = AddPositionEmbs(config=self.config, decode=True, rngs=self.rngs)
+        module.init_cache(input_shape=(1,1,self.config.emb_dim))
+        self.assertTrue(hasattr(module, 'cache_index'))
+        self.assertEqual(module.cache_index.value, 0)
+        self.assertEqual(module.cache_index.value.dtype, jnp.uint32)
 
 if __name__ == '__main__':
     unittest.main() 
