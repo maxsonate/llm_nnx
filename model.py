@@ -7,17 +7,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
-
+import dataclasses
+from llm_nnx.configs import default
 Shape = Sequence[int]
 Dtype = Any
 
-@struct.dataclass
+
+@dataclasses.dataclass(unsafe_hash=True)
 class TransformerConfig:
   """Global hyperparameters used to minimize obnoxious kwarg plumbing."""
 
   vocab_size: int
   output_vocab_size: int
-  share_embeddings: bool = False
   logits_via_embedding: bool = False
   dtype: Any = jnp.float32
   emb_dim: int = 512
@@ -28,11 +29,16 @@ class TransformerConfig:
   max_len: int = 2048
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
+  kernel_init: nnx.Initializer = nnx.initializers.xavier_uniform()
+  bias_init: nnx.Initializer = nnx.initializers.normal(stddev=1e-6)
+  posemb_init: nnx.Initializer | None = None
   deterministic: bool = False
-  decode: bool = False
-  kernel_init: Callable = nn.initializers.xavier_uniform()
-  bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-  posemb_init: Callable | None = None
+  axis_rules: default.MeshRules = dataclasses.field(
+    default_factory=default.MeshRules
+  )
+
+  def replace(self, **kwargs):
+    return dataclasses.replace(self, **kwargs)
 
 
 def shift_right(x, axis=1):
@@ -158,4 +164,56 @@ class AddPositionEmbs(nnx.Module):
 
   def init_cache(self, input_shape: Shape, dtype: Dtype = jnp.float32):
     self.cache_index = nnx.Cache(jnp.array(0, dtype=jnp.uint32))
+
+
+
+class MlpBlock(nnx.Module):
+  """Transformer MLP / feed-forward block.
+
+  Args:
+    config: TransformerConfig dataclass containing hyperparameters.
+    out_dim: optionally specify out dimension.
+  """
+
+  def __init__(self, config: TransformerConfig, *, rngs: nnx.Rngs):
+    self.config = config
+
+    self.linear1 = nnx.Linear(
+      config.emb_dim,
+      config.mlp_dim,
+      dtype=config.dtype,
+      kernel_init=nnx.with_partitioning(
+        config.kernel_init,
+        config.axis_rules('embed', 'mlp'),
+      ),
+      bias_init=nnx.with_partitioning(
+        config.bias_init,
+        config.axis_rules('mlp'),
+      ),
+      rngs=rngs,
+    )
+    self.linear2 = nnx.Linear(
+      config.mlp_dim,
+      config.emb_dim,
+      dtype=config.dtype,
+      kernel_init=nnx.with_partitioning(
+        config.kernel_init,
+        config.axis_rules('mlp', 'embed'),
+      ),
+      bias_init=nnx.with_partitioning(
+        config.bias_init,
+        config.axis_rules('embed'),
+      ),
+      rngs=rngs,
+    )
+    self.dropout = nnx.Dropout(rate=config.dropout_rate, deterministic=config.deterministic)
+
+  def __call__(self, inputs: jax.Array, *, rngs: nnx.Rngs | None = None):
+    """Applies Transformer MlpBlock module."""
+    x = self.linear1(inputs)
+    x = nnx.relu(x)
+    x = self.dropout(x, rngs=rngs)
+    output = self.linear2(x)
+    output = self.dropout(output, rngs=rngs)
+    return output
 
