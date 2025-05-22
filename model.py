@@ -7,17 +7,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
-
+import dataclasses
+from llm_nnx.configs import default
 Shape = Sequence[int]
 Dtype = Any
 
-@struct.dataclass
+
+@dataclasses.dataclass(unsafe_hash=True)
 class TransformerConfig:
   """Global hyperparameters used to minimize obnoxious kwarg plumbing."""
 
   vocab_size: int
   output_vocab_size: int
-  share_embeddings: bool = False
   logits_via_embedding: bool = False
   dtype: Any = jnp.float32
   emb_dim: int = 512
@@ -28,11 +29,18 @@ class TransformerConfig:
   max_len: int = 2048
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
+  kernel_init: nnx.Initializer = nnx.initializers.xavier_uniform()
+  bias_init: nnx.Initializer = nnx.initializers.normal(stddev=1e-6)
+  posemb_init: nnx.Initializer | None = None
   deterministic: bool = False
-  decode: bool = False
-  kernel_init: Callable = nn.initializers.xavier_uniform()
-  bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-  posemb_init: Callable | None = None
+  
+  
+  axis_rules: default.MeshRules = dataclasses.field(
+    default_factory=default.MeshRules
+  )
+
+  def replace(self, **kwargs):
+    return dataclasses.replace(self, **kwargs)
 
 
 def shift_right(x, axis=1):
@@ -161,6 +169,58 @@ class AddPositionEmbs(nnx.Module):
 
 
 
+class MlpBlock(nnx.Module):
+  """Transformer MLP / feed-forward block.
+
+  Args:
+    config: TransformerConfig dataclass containing hyperparameters.
+    out_dim: optionally specify out dimension.
+  """
+
+  def __init__(self, config: TransformerConfig, *, rngs: nnx.Rngs):
+    self.config = config
+
+    self.linear1 = nnx.Linear(
+      config.emb_dim,
+      config.mlp_dim,
+      dtype=config.dtype,
+      kernel_init=nnx.with_partitioning(
+        config.kernel_init,
+        config.axis_rules('embed', 'mlp'),
+      ),
+      bias_init=nnx.with_partitioning(
+        config.bias_init,
+        config.axis_rules('mlp'),
+      ),
+      rngs=rngs,
+    )
+    self.linear2 = nnx.Linear(
+      config.mlp_dim,
+      config.emb_dim,
+      dtype=config.dtype,
+      kernel_init=nnx.with_partitioning(
+        config.kernel_init,
+        config.axis_rules('mlp', 'embed'),
+      ),
+      bias_init=nnx.with_partitioning(
+        config.bias_init,
+        config.axis_rules('embed'),
+      ),
+      rngs=rngs,
+    )
+    self.dropout = nnx.Dropout(rate=config.dropout_rate, deterministic=config.deterministic)
+
+  def __call__(self, inputs: jax.Array, *, rngs: nnx.Rngs | None = None):
+    """Applies Transformer MlpBlock module."""
+    x = self.linear1(inputs)
+    x = nnx.relu(x)
+    x = self.dropout(x, rngs=rngs)
+    output = self.linear2(x)
+    output = self.dropout(output, rngs=rngs)
+    return output
+
+
+
 class EncoderDecoder1DBlock(nnx.Module):
   """Transformer encoder-decoder layer.
 
@@ -168,8 +228,12 @@ class EncoderDecoder1DBlock(nnx.Module):
     config: TransformerConfig dataclass containing hyperparameters.
   """
 
-  def __init__(self, config: TransformerConfig, *, rngs: nnx.Rngs):
+  def __init__(self, config: TransformerConfig, *, decode: bool = False, rngs: nnx.Rngs):
     self.config = config
+    self.decode = decode # Store decode flag
+    
+    # If decoding, sub-modules should operate deterministically
+    _deterministic = config.deterministic or decode
 
     self.ln1 = nnx.LayerNorm(
       num_features=config.emb_dim,
@@ -206,15 +270,18 @@ class EncoderDecoder1DBlock(nnx.Module):
         config.kernel_init, config.axis_rules('embed', 'kv')
       ),
       bias_init=nnx.with_partitioning(
-        config.bias_init, config.axis_rules('embed')
+        config.bias_init, config.axis_rules('embed') # Assuming bias, if used, aligns with 'embed'
       ),
-      use_bias=False,
-      broadcast_dropout=False,
+      use_bias=False, # As per original snippet for this block
+      broadcast_dropout=False, # As per original snippet
       dropout_rate=config.attention_dropout_rate,
+      deterministic=_deterministic, # Set deterministic for MHA's internal dropout
       rngs=rngs,
     )
-    self.mlp = MlpBlock(config=config, rngs=rngs)
-    self.dropout = nnx.Dropout(rate=config.dropout_rate)
+    # Pass updated config to MlpBlock for its deterministic state
+    mlp_config = config.replace(deterministic=_deterministic)
+    self.mlp = MlpBlock(config=mlp_config, rngs=rngs)
+    self.dropout = nnx.Dropout(rate=config.dropout_rate, deterministic=_deterministic)
 
   def __call__(
     self,
@@ -235,7 +302,7 @@ class EncoderDecoder1DBlock(nnx.Module):
     # Decoder block.
     assert inputs.ndim == 3
     x = self.ln1(inputs)
-    x = self.attention(x, mask=decoder_mask, rngs=rngs)
+    x = self.attention(x, mask=decoder_mask, decode=self.decode, rngs=rngs) # Pass self.decode here
     x = self.dropout(x, rngs=rngs)
     x = x + inputs
     # MLP block.
