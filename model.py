@@ -159,3 +159,86 @@ class AddPositionEmbs(nnx.Module):
   def init_cache(self, input_shape: Shape, dtype: Dtype = jnp.float32):
     self.cache_index = nnx.Cache(jnp.array(0, dtype=jnp.uint32))
 
+
+
+class EncoderDecoder1DBlock(nnx.Module):
+  """Transformer encoder-decoder layer.
+
+  Args:
+    config: TransformerConfig dataclass containing hyperparameters.
+  """
+
+  def __init__(self, config: TransformerConfig, *, rngs: nnx.Rngs):
+    self.config = config
+
+    self.ln1 = nnx.LayerNorm(
+      num_features=config.emb_dim,
+      dtype=config.dtype,
+      bias_init=nnx.with_partitioning(
+        nnx.initializers.zeros_init(),
+        config.axis_rules('embed'),
+      ),
+      scale_init=nnx.with_partitioning(
+        nnx.initializers.ones_init(),
+        config.axis_rules('embed'),
+      ),
+      rngs=rngs,
+    )
+    self.ln2 = nnx.LayerNorm(
+      num_features=config.emb_dim,
+      dtype=config.dtype,
+      bias_init=nnx.with_partitioning(
+        nnx.initializers.zeros_init(),
+        config.axis_rules('embed'),
+      ),
+      scale_init=nnx.with_partitioning(
+        nnx.initializers.ones_init(),
+        config.axis_rules('embed'),
+      ),
+      rngs=rngs,
+    )
+    self.attention = nnx.MultiHeadAttention(
+      num_heads=config.num_heads,
+      in_features=config.emb_dim,
+      qkv_features=config.qkv_dim,
+      dtype=config.dtype,
+      kernel_init=nnx.with_partitioning(
+        config.kernel_init, config.axis_rules('embed', 'kv')
+      ),
+      bias_init=nnx.with_partitioning(
+        config.bias_init, config.axis_rules('embed')
+      ),
+      use_bias=False,
+      broadcast_dropout=False,
+      dropout_rate=config.attention_dropout_rate,
+      rngs=rngs,
+    )
+    self.mlp = MlpBlock(config=config, rngs=rngs)
+    self.dropout = nnx.Dropout(rate=config.dropout_rate)
+
+  def __call__(
+    self,
+    inputs: jax.Array,
+    *,
+    decoder_mask: jax.Array | None = None,
+    rngs: nnx.Rngs | None = None,
+  ):
+    """Applies EncoderDecoder1DBlock module.
+
+    Args:
+      inputs: input data for decoder
+      decoder_mask: decoder self-attention mask.
+
+    Returns:
+      output after transformer encoder-decoder block.
+    """
+    # Decoder block.
+    assert inputs.ndim == 3
+    x = self.ln1(inputs)
+    x = self.attention(x, mask=decoder_mask, rngs=rngs)
+    x = self.dropout(x, rngs=rngs)
+    x = x + inputs
+    # MLP block.
+    z = self.ln2(x)
+    z = self.mlp(z, rngs=rngs)
+    return x + z
