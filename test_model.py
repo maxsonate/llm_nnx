@@ -5,7 +5,7 @@ import numpy as np # Kept for existing tests
 from flax import nnx # For new tests
 
 # Consolidated and corrected model imports
-from llm_nnx.model import (
+from model import (
     shift_right, shift_inputs, sinusoidal_init, 
     TransformerConfig, AddPositionEmbs, MlpBlock, Shape
 )
@@ -59,7 +59,7 @@ class TestModelFunctions(unittest.TestCase):
     def test_sinusoidal_init(self):
         max_len = 50
         d_feature = 128
-        key = jax.random.PRNGKey(0) # JAX needs a key for random ops, though not strictly used by this init
+        key = jax.random.key(0) # JAX needs a key for random ops, though not strictly used by this init
 
         # Get the initializer function
         init_fn = sinusoidal_init(max_len=max_len)
@@ -84,6 +84,21 @@ class TestModelFunctions(unittest.TestCase):
         pos_emb_odd = init_fn(key, shape_odd) # init_fn is for a fixed max_len, but d_feature comes from shape
         self.assertEqual(pos_emb_odd.shape, shape_odd)
         self.assertFalse(jnp.all(pos_emb_odd == 0))
+
+    def test_sinusoidal_init_edge_cases(self):
+        """Test edge cases for sinusoidal_init validation."""
+        key = jax.random.key(0)
+        
+        # Test that d_feature < 2 raises ValueError
+        init_fn = sinusoidal_init(max_len=10)
+        with self.assertRaises(ValueError):
+            init_fn(key, (1, 10, 1))  # d_feature = 1 should raise error
+        
+        # Test minimum valid d_feature works
+        shape_min = (1, 10, 2)
+        pos_emb_min = init_fn(key, shape_min)
+        self.assertEqual(pos_emb_min.shape, shape_min)
+        self.assertFalse(jnp.all(pos_emb_min == 0))
 
 class TestAddPositionEmbs(unittest.TestCase):
 
@@ -157,6 +172,16 @@ class TestAddPositionEmbs(unittest.TestCase):
         self.assertEqual(module.cache_index.value, 0)
         self.assertEqual(module.cache_index.value.dtype, jnp.uint32)
 
+    def test_decode_mode_without_cache_init(self):
+        """Test that decode mode raises error when cache is not initialized."""
+        batch_size, seq_len, emb_dim = 1, 1, self.config.emb_dim
+        inputs = jnp.ones((batch_size, seq_len, emb_dim))
+        module = AddPositionEmbs(config=self.config, decode=True, rngs=self.rngs)
+        
+        # Should raise RuntimeError when trying to use decode mode without cache init
+        with self.assertRaises(RuntimeError):
+            module(inputs)
+
 class TestMlpBlock(unittest.TestCase):
 
     def setUp(self):
@@ -174,7 +199,6 @@ class TestMlpBlock(unittest.TestCase):
         )
         self.rngs_params = nnx.Rngs(params=jax.random.key(0))
         self.rngs_dropout_active = nnx.Rngs(dropout=jax.random.key(1))
-        self.rngs_params_and_dropout = nnx.Rngs(params=jax.random.key(0), dropout=jax.random.key(1))
 
     def test_output_shape(self):
         batch_size, seq_len = 2, 5

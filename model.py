@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 import dataclasses
-from llm_nnx.configs import default
+from configs import default
 Shape = Sequence[int]
 Dtype = Any
 
@@ -77,10 +77,22 @@ def sinusoidal_init(max_len=2048, min_scale=1.0, max_scale=10000.0):
     """Sinusoidal init."""
     del key, dtype
     d_feature = shape[-1]
+    
+    # Validate minimum d_feature size to prevent division by zero
+    if d_feature < 2:
+      raise ValueError(f"d_feature must be at least 2, got {d_feature}")
+    
     pe = np.zeros((max_len, d_feature), dtype=np.float32)
     position = np.arange(0, max_len)[:, np.newaxis]
-    scale_factor = -np.log(max_scale / min_scale) / (d_feature // 2 - 1)
-    div_term = min_scale * np.exp(np.arange(0, d_feature // 2) * scale_factor)
+    
+    # Handle special case when d_feature = 2 to avoid division by zero
+    if d_feature == 2:
+      # For d_feature=2, we have only one frequency component
+      div_term = np.array([min_scale])
+    else:
+      scale_factor = -np.log(max_scale / min_scale) / (d_feature // 2 - 1)
+      div_term = min_scale * np.exp(np.arange(0, d_feature // 2) * scale_factor)
+    
     pe[:, : d_feature // 2] = np.sin(position * div_term)
     pe[:, d_feature // 2 : 2 * (d_feature // 2)] = np.cos(position * div_term)
     pe = pe[np.newaxis, :, :]  # [1, max_len, d_feature]
@@ -146,6 +158,10 @@ class AddPositionEmbs(nnx.Module):
 
     # We use a cache position index for tracking decoding position.
     if self.decode:
+      # Ensure cache is initialized when in decode mode
+      if not hasattr(self, 'cache_index'):
+        raise RuntimeError("Cache not initialized. Call init_cache() before using decode mode.")
+      
       _, _, df = pos_embedding.shape
       # equivalent to pos_embedding[:, i:i+1] but traceable
       pos_embedding = lax.dynamic_slice(
