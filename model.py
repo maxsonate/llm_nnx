@@ -1,7 +1,7 @@
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from modules import TransformerConfig, MlpBlock
+from modules import TransformerConfig, MlpBlock, MultiHeadAttention
 
 
 class EncoderDecoder1DBlock(nnx.Module):
@@ -44,7 +44,7 @@ class EncoderDecoder1DBlock(nnx.Module):
       ),
       rngs=rngs,
     )
-    self.attention = nnx.MultiHeadAttention(
+    self.attention = MultiHeadAttention(
       num_heads=config.num_heads,
       in_features=config.emb_dim,
       qkv_features=config.qkv_dim,
