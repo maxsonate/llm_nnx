@@ -7,7 +7,7 @@ from flax import nnx # For new tests
 # Consolidated and corrected model imports
 from model import (
     shift_right, shift_inputs, sinusoidal_init, 
-    TransformerConfig, AddPositionEmbs, MlpBlock, Shape
+    TransformerConfig, AddPositionEmbs, MlpBlock, Shape, EncoderDecoder1DBlock
 )
 
 class TestModelFunctions(unittest.TestCase):
@@ -221,15 +221,20 @@ class TestMlpBlock(unittest.TestCase):
 
     def test_dropout_non_deterministic_behavior(self):
         batch_size, seq_len = 2, 5
-        inputs = jnp.ones((batch_size, seq_len, self.config.emb_dim))
+        # Use random inputs to ensure LayerNorm doesn't output all zeros
+        data_key = jax.random.key(600) # Key for generating input data
+        inputs = jax.random.normal(data_key, (batch_size, seq_len, self.config.emb_dim))
         
-        config_with_dropout = self.config.replace(dropout_rate=0.5)
-        rngs_init = nnx.Rngs(params=jax.random.key(20))
+        # Ensure deterministic is False (default or explicitly set)
+        config_with_dropout = self.config.replace(dropout_rate=0.5, attention_dropout_rate=0.5, deterministic=False)
+        
+        rngs_init = nnx.Rngs(params=jax.random.key(60))
         mlp_block = MlpBlock(config=config_with_dropout, rngs=rngs_init)
         
-        outputs1 = mlp_block(inputs, rngs=nnx.Rngs(dropout=jax.random.key(31)))
-        outputs2 = mlp_block(inputs, rngs=nnx.Rngs(dropout=jax.random.key(32)))
+        outputs1 = mlp_block(inputs, rngs=nnx.Rngs(dropout=jax.random.key(61)))
+        outputs2 = mlp_block(inputs, rngs=nnx.Rngs(dropout=jax.random.key(62))) # Different dropout key
         
+        # Outputs should differ due to active dropout and different RNG keys
         self.assertFalse(jnp.allclose(outputs1, outputs2), "Outputs should differ when dropout is active and rngs differ.")
 
     def test_mlp_block_values(self):
@@ -262,6 +267,128 @@ class TestMlpBlock(unittest.TestCase):
         
         expected_output = jnp.array([[[4., 5.]]])
         np.testing.assert_allclose(np.array(outputs), np.array(expected_output), rtol=1e-6)
+
+class TestEncoderDecoder1DBlock(unittest.TestCase):
+
+    def setUp(self):
+        self.config = TransformerConfig(
+            vocab_size=100,
+            output_vocab_size=100,
+            emb_dim=8,
+            max_len=10,
+            num_heads=2,
+            num_layers=1, # Not directly used by a single block, but good for consistency
+            qkv_dim=8, # qkv_dim must be divisible by num_heads if broadcast_dropout is False
+            mlp_dim=16,
+            dropout_rate=0.1,
+            attention_dropout_rate=0.1
+        )
+        self.rngs_params = nnx.Rngs(params=jax.random.key(0))
+        self.rngs_dropout_active = nnx.Rngs(dropout=jax.random.key(1))
+        self.rngs_params_and_dropout = nnx.Rngs(params=jax.random.key(0), dropout=jax.random.key(1))
+
+    def test_output_shape(self):
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len, self.config.emb_dim))
+        block = EncoderDecoder1DBlock(config=self.config, decode=False, rngs=self.rngs_params)
+        outputs = block(inputs, rngs=self.rngs_dropout_active)
+        self.assertEqual(outputs.shape, inputs.shape)
+
+    def test_output_shape_with_mask(self):
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len, self.config.emb_dim))
+        # Causal mask for decoder
+        mask = nnx.make_causal_mask(inputs[:, :, 0]) # (batch_size, seq_len, seq_len)
+        block = EncoderDecoder1DBlock(config=self.config, decode=False, rngs=self.rngs_params)
+        outputs = block(inputs, decoder_mask=mask, rngs=self.rngs_dropout_active)
+        self.assertEqual(outputs.shape, inputs.shape)
+
+    def test_dropout_deterministic_behavior(self):
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len, self.config.emb_dim))
+        
+        # Set deterministic to True in the config for all submodules
+        # Note: if decode=True, deterministic will also become true for submodules in EncoderDecoder1DBlock
+        config_deterministic = self.config.replace(dropout_rate=0.5, attention_dropout_rate=0.5, deterministic=True)
+        
+        # rngs for initialization
+        rngs_init = nnx.Rngs(params=jax.random.key(50))
+        block = EncoderDecoder1DBlock(config=config_deterministic, decode=False, rngs=rngs_init)
+        
+        # When deterministic is True, rngs for the call should not affect output
+        outputs1 = block(inputs, rngs=None) 
+        outputs2 = block(inputs, rngs=nnx.Rngs(dropout=jax.random.key(51))) # Different dropout key
+        
+        np.testing.assert_array_equal(np.array(outputs1), np.array(outputs2))
+
+    def test_dropout_non_deterministic_behavior(self):
+        batch_size, seq_len = 2, 5
+        # Use random inputs to ensure LayerNorm doesn't output all zeros
+        data_key = jax.random.key(600) # Key for generating input data
+        inputs = jax.random.normal(data_key, (batch_size, seq_len, self.config.emb_dim))
+        
+        # Ensure deterministic is False (default or explicitly set)
+        config_with_dropout = self.config.replace(dropout_rate=0.5, attention_dropout_rate=0.5, deterministic=False)
+        
+        rngs_init = nnx.Rngs(params=jax.random.key(60))
+        block = EncoderDecoder1DBlock(config=config_with_dropout, decode=False, rngs=rngs_init)
+        
+        outputs1 = block(inputs, rngs=nnx.Rngs(dropout=jax.random.key(61)))
+        outputs2 = block(inputs, rngs=nnx.Rngs(dropout=jax.random.key(62))) # Different dropout key
+        
+        # Outputs should differ due to active dropout and different RNG keys
+        self.assertFalse(jnp.allclose(outputs1, outputs2), "Outputs should differ when dropout is active and rngs differ.")
+
+    def test_block_values_simple(self):
+        # Keep dimensions very small to make manual calculation/reasoning feasible
+        batch_size, seq_len, emb_dim, mlp_dim, qkv_dim, num_heads = 1, 1, 2, 4, 2, 1
+        inputs = jnp.array([[[1., 2.]]], dtype=jnp.float32) # (1, 1, 2)
+
+        # Configure with no dropout and simple initializers for predictability
+        # Using lambdas for initializers to control weight values
+        def simple_kernel_init(key, shape, dtype):
+            # Return small, distinct integers for easier debugging
+            return jnp.arange(np.prod(shape), dtype=dtype).reshape(shape) * 0.1 + 0.1
+            
+        def simple_bias_init(key, shape, dtype):
+            return jnp.ones(shape, dtype=dtype) * 0.05
+
+        config_value_test = TransformerConfig(
+            emb_dim=emb_dim,
+            mlp_dim=mlp_dim,
+            qkv_dim=qkv_dim,
+            num_heads=num_heads,
+            dropout_rate=0.0, # No dropout
+            attention_dropout_rate=0.0, # No attention dropout
+            deterministic=True, # Ensure all sub-modules are deterministic
+            kernel_init=simple_kernel_init,
+            bias_init=simple_bias_init,
+            # Dummy values for other required TransformerConfig fields
+            vocab_size=10, output_vocab_size=10, num_layers=1, max_len=10
+        )
+        
+        # Initialize the block
+        rngs_init = nnx.Rngs(params=jax.random.key(70))
+        # For value tests, ensure decode is False to match typical training/non-autoregressive scenarios
+        block = EncoderDecoder1DBlock(config=config_value_test, decode=False, rngs=rngs_init)
+        
+        # Call the block (no dropout RNGs needed as dropout_rate is 0)
+        outputs = block(inputs, rngs=None) 
+        
+        # Basic checks: output shape
+        self.assertEqual(outputs.shape, inputs.shape)
+        
+        # Check that output is not equal to input (it should have been processed)
+        self.assertFalse(jnp.allclose(outputs, inputs), "Output should not be the same as input.")
+
+        # Note: A precise value check here is complex due to multiple layers
+        # (LayerNorm, Attention, MLP). This test primarily ensures the block runs,
+        # output shape is correct, and output differs from input with deterministic settings.
+        # For more detailed value tests, one would typically test LayerNorm, Attention,
+        # and MLP components individually with known weights, as done in TestMlpBlock.
+        
+        # Example: Check if output is not all zeros (a weak check, but better than nothing)
+        self.assertFalse(jnp.all(outputs == 0))
 
 if __name__ == '__main__':
     unittest.main() 
