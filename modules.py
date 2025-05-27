@@ -1,14 +1,26 @@
+import dataclasses
+import functools
 from typing import Any, Callable, Sequence
 
 import flax.linen as nn
-from flax import nnx
-import jax.lax as lax
+from flax import nnx, struct
+from flax.linen import initializers
+from flax.typing import (
+  PromoteDtypeFn,
+  Initializer,
+  PrecisionLike,
+  DotGeneralT,
+)
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
+from jax import Array
 import numpy as np
-from flax import struct
-import dataclasses
+from flax.nnx.nn.normalization import LayerNorm
+from flax.nnx.nn.attention import dot_product_attention
+
 from configs import default
+
 Shape = Sequence[int]
 Dtype = Any
 
@@ -256,57 +268,103 @@ class MultiHeadAttention(nnx.Module):
     self,
     num_heads: int,
     in_features: int,
-    qkv_features: int,
+    qkv_features: int | None = None,
+    out_features: int | None = None,
+    in_kv_features: int | None = None,
     *,
-    dtype: Dtype = jnp.float32,
-    kernel_init: nnx.Initializer = nnx.initializers.xavier_uniform(),
-    bias_init: nnx.Initializer = nnx.initializers.zeros_init(),
-    use_bias: bool = True,
+    dtype: Dtype | None = None,
+    param_dtype: Dtype = jnp.float32,
     broadcast_dropout: bool = True,
     dropout_rate: float = 0.0,
-    deterministic: bool = False,
-    decode: bool = False,
+    deterministic: bool | None = None,
+    precision: PrecisionLike = None,
+    kernel_init: Initializer = nnx.nn.linear.default_kernel_init,
+    out_kernel_init: Initializer | None = None,
+    bias_init: Initializer = initializers.zeros_init(),
+    out_bias_init: Initializer | None = None,
+    use_bias: bool = True,
+    attention_fn: Callable[..., Array] = dot_product_attention,
+    decode: bool | None = None,
+    normalize_qk: bool = False,
     rngs: nnx.Rngs,
   ):
-    """Initialize MultiHeadAttention.
-    
-    TODO: Implement initialization logic including:
-    - Query, key, value projection layers
-    - Output projection layer
-    - Dropout layers
-    - Cache variables for decode mode
-    """
     self.num_heads = num_heads
     self.in_features = in_features
-    self.qkv_features = qkv_features
+    self.qkv_features = (
+      qkv_features if qkv_features is not None else in_features
+    )
+    self.out_features = (
+      out_features if out_features is not None else in_features
+    )
+    self.in_kv_features = (
+      in_kv_features if in_kv_features is not None else in_features
+    )
     self.dtype = dtype
-    self.use_bias = use_bias
+    self.param_dtype = param_dtype
     self.broadcast_dropout = broadcast_dropout
     self.dropout_rate = dropout_rate
     self.deterministic = deterministic
+    self.precision = precision
+    self.kernel_init = kernel_init
+    self.out_kernel_init = out_kernel_init
+    self.bias_init = bias_init
+    self.out_bias_init = out_bias_init
+    self.use_bias = use_bias
+    self.attention_fn = attention_fn
     self.decode = decode
+    self.normalize_qk = normalize_qk
+
     
     # Combined QKV projection (more efficient than separate projections)
-    self.qkv_proj = nnx.LinearGeneral(
-      in_features=in_features,
-      out_features=(num_heads, 3 * qkv_features),  # 3x the size for Q, K, V combined
+    assert in_features % num_heads == 0, "in_features must be divisible by num_heads"
+    head_dim = in_features // num_heads
+    
+    linear_general = functools.partial(nnx.LinearGeneral,
+                                       in_features=in_features,
+      out_features=(num_heads,head_dim), 
       dtype=dtype,
       kernel_init=kernel_init,
       bias_init=bias_init,
       use_bias=use_bias,
       rngs=rngs,
     )
+    self.query = linear_general(self.in_features)
+    self.key = linear_general(self.in_kv_features)
+    self.value = linear_general(self.in_kv_features)
+
+
     
     self.out_proj = nnx.LinearGeneral(
-      in_features=(num_heads, qkv_features),
-      out_features=in_features,
+      in_features=(num_heads, head_dim),
+      out_features=self.out_features,
       dtype=dtype,
       kernel_init=kernel_init,
       bias_init=bias_init,
+      use_bias=use_bias,
+      rngs=rngs,
     )
 
+    self.query_ln = LayerNorm(in_features=head_dim,
+                              dtype=dtype,
+                              param_dtype=param_dtype,
+                              use_bias=False,
+                              rngs=rngs,
+                              )
+    self.key_ln = LayerNorm(in_features=head_dim,
+                            dtype=dtype,
+                            use_bias=False,
+                            param_dtype=param_dtype,
+                            rngs=rngs,
+                            )
+    
+
+    self.rngs = rngs if dropout_rate > 0 else None
+
     self.dropout = nnx.Dropout(rate=dropout_rate, deterministic=deterministic)
-    self.cache_index = nnx.Cache(jnp.array(0, dtype=jnp.uint32))
+
+    self.cache_key: nnx.Cache[Array] | None = None
+    self.cache_value: nnx.Cache[Array] | None = None
+    self.cache_index: nnx.Cache[Array] | None = None
 
 
   def init_cache(self, input_shape: Shape):
@@ -345,8 +403,7 @@ class MultiHeadAttention(nnx.Module):
     - Residual connections and dropout
     """
     # Combined QKV projection and split
-    qkv = self.qkv_proj(inputs)  # Shape: (batch, seq_len, 3 * qkv_features)
-    query, key, value = jnp.split(qkv, 3, axis=-1)  # Split into Q, K, V
+
     
     # TODO: Implement scaled dot-product attention
     # TODO: Apply mask if provided
