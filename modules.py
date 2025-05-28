@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from jax import Array
 import numpy as np
 from flax.nnx.nn.normalization import LayerNorm
+from flax.nnx.module import first_from
 from flax.nnx.nn.attention import dot_product_attention
 
 from configs import default
@@ -320,8 +321,7 @@ class MultiHeadAttention(nnx.Module):
     head_dim = in_features // num_heads
     
     linear_general = functools.partial(nnx.LinearGeneral,
-                                       in_features=in_features,
-      out_features=(num_heads,head_dim), 
+                                       out_features=(num_heads, head_dim), 
       dtype=dtype,
       kernel_init=kernel_init,
       bias_init=bias_init,
@@ -337,6 +337,7 @@ class MultiHeadAttention(nnx.Module):
     self.out_proj = nnx.LinearGeneral(
       in_features=(num_heads, head_dim),
       out_features=self.out_features,
+      axis=(-2, -1),  # Contract over the last two dimensions (num_heads, head_dim)
       dtype=dtype,
       kernel_init=kernel_init,
       bias_init=bias_init,
@@ -344,13 +345,13 @@ class MultiHeadAttention(nnx.Module):
       rngs=rngs,
     )
 
-    self.query_ln = LayerNorm(in_features=head_dim,
+    self.query_ln = LayerNorm(num_features=head_dim,
                               dtype=dtype,
                               param_dtype=param_dtype,
                               use_bias=False,
                               rngs=rngs,
                               )
-    self.key_ln = LayerNorm(in_features=head_dim,
+    self.key_ln = LayerNorm(num_features=head_dim,
                             dtype=dtype,
                             use_bias=False,
                             param_dtype=param_dtype,
@@ -379,19 +380,29 @@ class MultiHeadAttention(nnx.Module):
 
   def __call__(
     self,
-    inputs: jax.Array,
+    inputs_q: Array,
+    inputs_k: Array | None = None,
+    inputs_v: Array | None = None,
     *,
-    mask: jax.Array | None = None,
-    decode: bool | None = None,
+    mask: Array | None = None,
+    deterministic: bool | None = None,
     rngs: nnx.Rngs | None = None,
-  ) -> jax.Array:
+    sow_weights: bool = False,
+    decode: bool | None = None,
+  ):
     """Apply multi-head attention.
     
     Args:
-      inputs: Input tensor of shape (batch_size, seq_len, features).
+      inputs_q: Query input tensor of shape (batch_size, seq_len, features).
+      inputs_k: Key input tensor of shape (batch_size, seq_len, features). 
+                If None, uses inputs_q.
+      inputs_v: Value input tensor of shape (batch_size, seq_len, features). 
+                If None, uses inputs_k.
       mask: Attention mask of shape (batch_size, num_heads, seq_len, seq_len).
-      decode: Whether to use autoregressive decoding.
+      deterministic: Whether to use deterministic behavior (disables dropout).
       rngs: Random number generators for dropout.
+      sow_weights: Whether to store attention weights for debugging.
+      decode: Whether to use autoregressive decoding.
       
     Returns:
       Output tensor of shape (batch_size, seq_len, features).
@@ -402,14 +413,90 @@ class MultiHeadAttention(nnx.Module):
     - Output projection
     - Residual connections and dropout
     """
-    # Combined QKV projection and split
+
+    if rngs is None:
+      rngs = self.rngs
+
+    if inputs_k is None:
+      if inputs_v is not None:
+        raise ValueError(
+          '`inputs_k` cannot be None if `inputs_v` is not None. '
+          'To have both `inputs_k` and `inputs_v` be the same value, pass in the '
+          'value to `inputs_k` and leave `inputs_v` as None.'
+        )
+      inputs_k = inputs_q
+    if inputs_v is None:
+      inputs_v = inputs_k
+    
+    if inputs_q.shape[-1] != self.in_features:
+      raise ValueError(f"inputs_q.shape[-1] ({inputs_q.shape[-1]}) != in_features ({self.in_features})")
+    if inputs_k.shape[-1] != self.in_kv_features:
+      raise ValueError(f"inputs_k.shape[-1] ({inputs_k.shape[-1]}) != in_kv_features ({self.in_kv_features})")
+    if inputs_v.shape[-1] != self.in_kv_features:
+      raise ValueError(f"inputs_v.shape[-1] ({inputs_v.shape[-1]}) != in_kv_features ({self.in_kv_features})")
+    
+  
+    query = self.query(inputs_q)
+    key = self.key(inputs_k)
+    value = self.value(inputs_v)
+
+    if self.normalize_qk:
+      assert self.query_ln is not None, "query_ln must be provided if normalize_qk is True"
+      assert self.key_ln is not None, "key_ln must be provided if normalize_qk is True"
+
+      inputs_q = self.query_ln(inputs_q)
+      inputs_k = self.key_ln(inputs_k)
+
+
+
+    if self.query_ln:
+      query = self.query_ln(query)
+    if self.key_ln:
+      key = self.key_ln(key)
 
     
-    # TODO: Implement scaled dot-product attention
-    # TODO: Apply mask if provided
-    # TODO: Handle decode mode with caching
-    # TODO: Apply dropout
-    # TODO: Concatenate heads and apply output projection
+    decode = first_from(decode,
+                        self.decode,
+                        error_msg='no decode argument provided either in __call__ or in init')
     
-    # Placeholder: return inputs unchanged for now
-    return inputs 
+    # TBD: Add decoding, if decode is True.
+
+    if self.dropout_rate > 0:
+      deterministic = first_from(deterministic,
+                                self.deterministic,
+                                error_msg='no deterministic argument provided either in __call__ or in init')
+      
+      # Only generate dropout RNGs when actually needed (non-deterministic mode)
+      # This avoids unnecessary RNG operations during inference/evaluation
+      if not deterministic:
+        # Ensure RNGs are provided when dropout is active - dropout requires randomness
+        if rngs is None:
+          raise ValueError('rngs must be provided if dropout_rate > 0 and deterministic is False')
+        dropout_rngs = rngs.dropout()
+      else:
+        # In deterministic mode, no dropout RNGs needed as dropout is disabled
+        dropout_rngs = None
+      
+    else:
+      # When dropout_rate is 0, bypass all dropout logic for efficiency
+      deterministic = False  # Value doesn't matter since dropout_rate is 0
+      dropout_rngs = None
+    
+    attn = self.attention_fn(query, key, value,       
+                             mask=mask,
+                            dropout_rng=dropout_rngs,
+                            dropout_rate=self.dropout_rate,
+                            broadcast_dropout=self.broadcast_dropout,
+                            deterministic=deterministic,
+                            dtype=self.dtype,
+                            precision=self.precision,
+                            module=self if sow_weights else None,)
+
+    
+
+    output = self.out_proj(attn)
+
+    return output
+
+    
+  # TODO: Implement decoding.
