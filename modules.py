@@ -363,8 +363,8 @@ class MultiHeadAttention(nnx.Module):
 
     self.dropout = nnx.Dropout(rate=dropout_rate, deterministic=deterministic)
 
-    self.cache_key: nnx.Cache[Array] | None = None
-    self.cache_value: nnx.Cache[Array] | None = None
+    self.cached_key: nnx.Cache[Array] | None = None
+    self.cached_value: nnx.Cache[Array] | None = None
     self.cache_index: nnx.Cache[Array] | None = None
 
 
@@ -376,7 +376,9 @@ class MultiHeadAttention(nnx.Module):
       
     TODO: Implement cache initialization for keys and values.
     """
-    pass
+    self.cached_key = nnx.Cache(jnp.zeros(input_shape[:-1] + (self.num_heads, self.in_features // self.num_heads), dtype=self.dtype))
+    self.cached_value = nnx.Cache(jnp.zeros(input_shape[:-1] + (self.num_heads, self.in_features // self.num_heads), dtype=self.dtype))
+    self.cache_index = nnx.Cache(jnp.array(0, dtype=jnp.uint32))
 
   def __call__(
     self,
@@ -460,6 +462,50 @@ class MultiHeadAttention(nnx.Module):
                         error_msg='no decode argument provided either in __call__ or in init')
     
     # TBD: Add decoding, if decode is True.
+    if decode:
+      if (
+        self.cached_key is None
+        or self.cached_value is None
+        or self.cache_index is None
+      ):
+        raise ValueError(
+          'Autoregressive cache not initialized, call ``init_cache`` first.'
+        )
+      (
+        *batch_dims,
+        max_length,
+        num_heads,
+        depth_per_head,
+      ) = self.cached_key.value.shape
+      # shape check of cached keys against query input
+      expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
+      if expected_shape != query.shape:
+        raise ValueError(
+          'Autoregressive cache shape error, '
+          'expected query shape %s instead got %s.'
+          % (expected_shape, query.shape)
+        )
+      # update key, value caches with our new 1d spatial slices
+      cur_index = self.cache_index[...]
+      zero = jnp.array(0, dtype=lax.dtype(cur_index.dtype))
+      indices = (zero,) * len(batch_dims) + (cur_index, zero, zero)
+      key = lax.dynamic_update_slice(self.cached_key[...], key, indices)
+      value = lax.dynamic_update_slice(self.cached_value[...], value, indices)
+      self.cached_key[...] = key
+      self.cached_value[...] = value
+      self.cache_index[...] += 1
+      # causal mask for cached decoder self-attention:
+      # our single query position should only attend to those key
+      # positions that have already been generated and cached,
+      # not the remaining zero elements.
+      mask = combine_masks(
+        mask,
+        jnp.broadcast_to(
+          jnp.arange(max_length) <= cur_index,
+          tuple(batch_dims) + (1, 1, max_length),
+        ),
+      )
+
 
     if self.dropout_rate > 0:
       deterministic = first_from(deterministic,
@@ -498,5 +544,41 @@ class MultiHeadAttention(nnx.Module):
 
     return output
 
+
+def combine_masks(
+    *masks: Array | None,
+    dtype: Dtype = jnp.bool_,
+) -> Array | None:
+  """Combine multiple attention masks into a single mask.
+  
+  Args:
+    *masks: Variable number of attention masks to combine. None values are ignored.
+    dtype: Data type for the combined mask. Defaults to jnp.bool_.
     
-  # TODO: Implement decoding.
+  Returns:
+    Combined mask using logical AND operation, or None if no valid masks provided.
+  """
+  # Filter out None masks
+  mask_list = [mask for mask in masks if mask is not None]
+  if not mask_list:
+    return None
+  
+  # Validate all masks have the same number of dimensions
+  first_mask_ndim = mask_list[0].ndim
+  mask_ndims = [mask.ndim for mask in mask_list]
+  
+  assert all(ndim == first_mask_ndim for ndim in mask_ndims), (
+    f'All masks should have the same rank. '
+    f'Expected: {first_mask_ndim}, got: {mask_ndims}'
+  )
+
+  # Combine masks using logical AND
+  mask, *rest = mask_list
+  for next_mask in rest:
+    mask = jnp.logical_and(mask, next_mask)
+
+  return mask.astype(dtype)
+
+
+  # TODO: Implement dot_product_attention.
+  # TODO: Add tests.
