@@ -345,18 +345,22 @@ class MultiHeadAttention(nnx.Module):
       rngs=rngs,
     )
 
-    self.query_ln = LayerNorm(num_features=head_dim,
+    if normalize_qk:
+      self.query_ln = LayerNorm(num_features=head_dim,
+                                dtype=dtype,
+                                param_dtype=param_dtype,
+                                use_bias=False,
+                                rngs=rngs,
+                                )
+      self.key_ln = LayerNorm(num_features=head_dim,
                               dtype=dtype,
-                              param_dtype=param_dtype,
                               use_bias=False,
+                              param_dtype=param_dtype,
                               rngs=rngs,
                               )
-    self.key_ln = LayerNorm(num_features=head_dim,
-                            dtype=dtype,
-                            use_bias=False,
-                            param_dtype=param_dtype,
-                            rngs=rngs,
-                            )
+    else:
+      self.query_ln = None
+      self.key_ln = None
     
 
     self.rngs = rngs if dropout_rate > 0 else None
@@ -443,20 +447,11 @@ class MultiHeadAttention(nnx.Module):
     value = self.value(inputs_v)
 
     if self.normalize_qk:
-      assert self.query_ln is not None, "query_ln must be provided if normalize_qk is True"
-      assert self.key_ln is not None, "key_ln must be provided if normalize_qk is True"
-
-      inputs_q = self.query_ln(inputs_q)
-      inputs_k = self.key_ln(inputs_k)
-
-
-
-    if self.query_ln:
+      # Apply layer normalization to query and key after projection
       query = self.query_ln(query)
-    if self.key_ln:
       key = self.key_ln(key)
 
-    
+
     decode = first_from(decode,
                         self.decode,
                         error_msg='no decode argument provided either in __call__ or in init')
@@ -486,14 +481,14 @@ class MultiHeadAttention(nnx.Module):
           % (expected_shape, query.shape)
         )
       # update key, value caches with our new 1d spatial slices
-      cur_index = self.cache_index[...]
+      cur_index = self.cache_index.value
       zero = jnp.array(0, dtype=lax.dtype(cur_index.dtype))
       indices = (zero,) * len(batch_dims) + (cur_index, zero, zero)
-      key = lax.dynamic_update_slice(self.cached_key[...], key, indices)
-      value = lax.dynamic_update_slice(self.cached_value[...], value, indices)
-      self.cached_key[...] = key
-      self.cached_value[...] = value
-      self.cache_index[...] += 1
+      key = lax.dynamic_update_slice(self.cached_key.value, key, indices)
+      value = lax.dynamic_update_slice(self.cached_value.value, value, indices)
+      self.cached_key.value = key
+      self.cached_value.value = value
+      self.cache_index.value += 1
       # causal mask for cached decoder self-attention:
       # our single query position should only attend to those key
       # positions that have already been generated and cached,

@@ -7,7 +7,7 @@ from flax import nnx # For new tests
 # Import from modules.py
 from modules import (
     shift_right, shift_inputs, sinusoidal_init, 
-    TransformerConfig, AddPositionEmbs, MlpBlock, Shape
+    TransformerConfig, AddPositionEmbs, MlpBlock, MultiHeadAttention, Shape
 )
 
 class TestModelFunctions(unittest.TestCase):
@@ -262,6 +262,292 @@ class TestMlpBlock(unittest.TestCase):
         
         expected_output = jnp.array([[[4., 5.]]])
         np.testing.assert_allclose(np.array(outputs), np.array(expected_output), rtol=1e-6)
+
+class TestMultiHeadAttention(unittest.TestCase):
+
+    def setUp(self):
+        self.config = TransformerConfig(
+            vocab_size=100,
+            output_vocab_size=100,
+            emb_dim=16,
+            max_len=10,
+            num_heads=4,
+            num_layers=1,
+            qkv_dim=16,
+            mlp_dim=32,
+            dropout_rate=0.1,
+            attention_dropout_rate=0.1
+        )
+        self.rngs_params = nnx.Rngs(params=jax.random.key(0))
+        self.rngs_dropout = nnx.Rngs(dropout=jax.random.key(1))
+
+    def test_basic_self_attention_shape(self):
+        """Test that self-attention preserves input shape."""
+        batch_size, seq_len, features = 2, 8, 16
+        inputs = jax.random.normal(jax.random.key(42), (batch_size, seq_len, features))
+        
+        attention = MultiHeadAttention(
+            num_heads=4,
+            in_features=features,
+            qkv_features=features,
+            dropout_rate=0.0,
+            deterministic=True,
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        outputs = attention(inputs, rngs=None)
+        self.assertEqual(outputs.shape, inputs.shape)
+
+    def test_cross_attention_shape(self):
+        """Test cross-attention with different key/value inputs."""
+        batch_size, seq_len_q, seq_len_kv, features = 2, 6, 8, 16
+        inputs_q = jax.random.normal(jax.random.key(1), (batch_size, seq_len_q, features))
+        inputs_kv = jax.random.normal(jax.random.key(2), (batch_size, seq_len_kv, features))
+        
+        attention = MultiHeadAttention(
+            num_heads=4,
+            in_features=features,
+            qkv_features=features,
+            dropout_rate=0.0,
+            deterministic=True,
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        outputs = attention(inputs_q, inputs_k=inputs_kv, inputs_v=inputs_kv, rngs=None)
+        self.assertEqual(outputs.shape, inputs_q.shape)
+
+    def test_different_feature_dimensions(self):
+        """Test attention with different input/output feature dimensions."""
+        batch_size, seq_len = 2, 6
+        in_features, qkv_features, out_features = 12, 16, 20
+        inputs = jax.random.normal(jax.random.key(3), (batch_size, seq_len, in_features))
+        
+        attention = MultiHeadAttention(
+            num_heads=4,
+            in_features=in_features,
+            qkv_features=qkv_features,
+            out_features=out_features,
+            dropout_rate=0.0,
+            deterministic=True,
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        outputs = attention(inputs, rngs=None)
+        self.assertEqual(outputs.shape, (batch_size, seq_len, out_features))
+
+    def test_mask_application(self):
+        """Test that attention mask is properly applied."""
+        batch_size, seq_len, features, num_heads = 1, 4, 8, 2
+        # Use varied inputs instead of all ones to make masking effects more visible
+        inputs = jax.random.normal(jax.random.key(42), (batch_size, seq_len, features))
+        
+        # Create a causal mask that blocks attention to future positions
+        mask = jnp.tril(jnp.ones((seq_len, seq_len)))  # Lower triangular mask
+        mask = mask[None, None, :, :]  # Add batch and head dimensions
+        mask = jnp.broadcast_to(mask, (batch_size, num_heads, seq_len, seq_len))
+        
+        attention = MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=features,
+            dropout_rate=0.0,
+            deterministic=True,
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        outputs_with_mask = attention(inputs, mask=mask, rngs=None)
+        outputs_without_mask = attention(inputs, rngs=None)
+        
+        # Outputs should be different when mask is applied
+        # Use a looser tolerance since the differences might be subtle
+        self.assertFalse(jnp.allclose(outputs_with_mask, outputs_without_mask, atol=1e-6))
+
+    def test_init_cache(self):
+        """Test cache initialization for autoregressive decoding."""
+        batch_size, seq_len, features = 2, 10, 16
+        input_shape = (batch_size, seq_len, features)
+        
+        attention = MultiHeadAttention(
+            num_heads=4,
+            in_features=features,
+            decode=True,
+            dropout_rate=0.0,
+            deterministic=True,
+            rngs=self.rngs_params
+        )
+        
+        attention.init_cache(input_shape)
+        
+        # Check that cache attributes are initialized
+        self.assertIsNotNone(attention.cached_key)
+        self.assertIsNotNone(attention.cached_value)
+        self.assertIsNotNone(attention.cache_index)
+        
+        # Check cache shapes
+        expected_cache_shape = (batch_size, seq_len, 4, features // 4)  # (batch, seq, heads, head_dim)
+        self.assertEqual(attention.cached_key.value.shape, expected_cache_shape)
+        self.assertEqual(attention.cached_value.value.shape, expected_cache_shape)
+        self.assertEqual(attention.cache_index.value, 0)
+
+    def test_decode_mode_without_cache_init(self):
+        """Test that decode mode raises error when cache is not initialized."""
+        batch_size, seq_len, features = 1, 1, 8
+        inputs = jnp.ones((batch_size, seq_len, features))
+        
+        attention = MultiHeadAttention(
+            num_heads=2,
+            in_features=features,
+            decode=True,
+            rngs=self.rngs_params
+        )
+        
+        # Should raise ValueError when trying to use decode mode without cache init
+        with self.assertRaises(ValueError):
+            attention(inputs, rngs=None)
+
+    def test_decode_mode_functionality(self):
+        """Test autoregressive decoding functionality."""
+        batch_size, max_seq_len, features = 1, 5, 8
+        
+        attention = MultiHeadAttention(
+            num_heads=2,
+            in_features=features,
+            decode=True,
+            dropout_rate=0.0,
+            deterministic=True,
+            rngs=self.rngs_params
+        )
+        
+        attention.init_cache((batch_size, max_seq_len, features))
+        
+        # Process tokens one by one
+        outputs = []
+        for i in range(3):
+            token_input = jax.random.normal(jax.random.key(i + 10), (batch_size, 1, features))
+            output = attention(token_input, decode=True, rngs=None)
+            outputs.append(output)
+            self.assertEqual(output.shape, (batch_size, 1, features))
+        
+        # Cache index should have incremented
+        self.assertEqual(attention.cache_index.value, 3)
+
+    def test_dropout_deterministic_vs_non_deterministic(self):
+        """Test dropout behavior in deterministic vs non-deterministic modes."""
+        batch_size, seq_len, features = 1, 4, 8
+        inputs = jnp.ones((batch_size, seq_len, features))
+        
+        # Test deterministic mode
+        attention_det = MultiHeadAttention(
+            num_heads=2,
+            in_features=features,
+            dropout_rate=0.5,
+            deterministic=True,
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        outputs1 = attention_det(inputs, rngs=None)
+        outputs2 = attention_det(inputs, rngs=None)
+        np.testing.assert_array_equal(np.array(outputs1), np.array(outputs2))
+        
+        # Test non-deterministic mode
+        attention_nondet = MultiHeadAttention(
+            num_heads=2,
+            in_features=features,
+            dropout_rate=0.5,
+            deterministic=False,
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        outputs3 = attention_nondet(inputs, rngs=nnx.Rngs(dropout=jax.random.key(100)))
+        outputs4 = attention_nondet(inputs, rngs=nnx.Rngs(dropout=jax.random.key(101)))
+        
+        # Outputs should be different with different dropout keys
+        self.assertFalse(jnp.allclose(outputs3, outputs4, atol=1e-6))
+
+    def test_no_dropout_efficiency(self):
+        """Test that no RNGs are needed when dropout_rate is 0."""
+        batch_size, seq_len, features = 1, 4, 8
+        inputs = jnp.ones((batch_size, seq_len, features))
+        
+        attention = MultiHeadAttention(
+            num_heads=2,
+            in_features=features,
+            dropout_rate=0.0,  # No dropout
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        # Should work without providing dropout RNGs
+        outputs = attention(inputs, rngs=None)
+        self.assertEqual(outputs.shape, inputs.shape)
+
+    def test_input_validation(self):
+        """Test input dimension validation."""
+        attention = MultiHeadAttention(
+            num_heads=2,
+            in_features=8,
+            in_kv_features=6,
+            rngs=self.rngs_params
+        )
+        
+        # Test incorrect query dimension
+        wrong_q = jnp.ones((1, 4, 10))  # Should be 8
+        correct_kv = jnp.ones((1, 4, 6))
+        
+        with self.assertRaises(ValueError):
+            attention(wrong_q, inputs_k=correct_kv, inputs_v=correct_kv, rngs=None)
+        
+        # Test incorrect key/value dimensions
+        correct_q = jnp.ones((1, 4, 8))
+        wrong_kv = jnp.ones((1, 4, 10))  # Should be 6
+        
+        with self.assertRaises(ValueError):
+            attention(correct_q, inputs_k=wrong_kv, inputs_v=correct_kv, rngs=None)
+
+    def test_normalize_qk_feature(self):
+        """Test query-key normalization feature."""
+        batch_size, seq_len, features = 1, 4, 8
+        inputs = jax.random.normal(jax.random.key(20), (batch_size, seq_len, features))
+        
+        attention_normalized = MultiHeadAttention(
+            num_heads=2,
+            in_features=features,
+            normalize_qk=True,
+            dropout_rate=0.0,
+            deterministic=True,
+            decode=False,
+            rngs=self.rngs_params
+        )
+        
+        attention_regular = MultiHeadAttention(
+            num_heads=2,
+            in_features=features,
+            normalize_qk=False,
+            dropout_rate=0.0,
+            deterministic=True,
+            decode=False,
+            rngs=nnx.Rngs(params=jax.random.key(0))  # Same initialization
+        )
+        
+        outputs_normalized = attention_normalized(inputs, rngs=None)
+        outputs_regular = attention_regular(inputs, rngs=None)
+        
+        # Outputs should be different when normalization is applied
+        self.assertFalse(jnp.allclose(outputs_normalized, outputs_regular, atol=1e-6))
+
+    def test_heads_divisibility_assertion(self):
+        """Test that in_features must be divisible by num_heads."""
+        with self.assertRaises(AssertionError):
+            MultiHeadAttention(
+                num_heads=3,
+                in_features=8,  # 8 is not divisible by 3
+                rngs=self.rngs_params
+            )
 
 if __name__ == '__main__':
     unittest.main() 
