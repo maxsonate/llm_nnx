@@ -7,7 +7,8 @@ from flax import nnx # For new tests
 # Import from modules.py
 from modules import (
     shift_right, shift_inputs, sinusoidal_init, 
-    TransformerConfig, AddPositionEmbs, MlpBlock, MultiHeadAttention, Shape
+    TransformerConfig, AddPositionEmbs, MlpBlock, MultiHeadAttention, Shape,
+    dot_product_attention_weights,
 )
 
 class TestModelFunctions(unittest.TestCase):
@@ -548,6 +549,150 @@ class TestMultiHeadAttention(unittest.TestCase):
                 in_features=8,  # 8 is not divisible by 3
                 rngs=self.rngs_params
             )
+
+class TestDotProductAttentionWeights(unittest.TestCase):
+
+    def setUp(self):
+        self.key = jax.random.key(0)
+        self.batch_size = 2
+        self.num_heads = 2
+        self.seq_len = 4
+        self.head_dim = 8
+
+        q_key, k_key, self.dropout_key = jax.random.split(self.key, 3)
+        self.query = jax.random.normal(q_key, (self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        self.key = jax.random.normal(k_key, (self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        self.dtype = jnp.float32
+
+    def test_output_shape(self):
+        """Test that the output shape is correct."""
+        attn_weights = dot_product_attention_weights(
+            self.query, self.key, deterministic=True, dtype=self.dtype
+        )
+        expected_shape = (self.batch_size, self.num_heads, self.seq_len, self.seq_len)
+        self.assertEqual(attn_weights.shape, expected_shape)
+
+    def test_softmax_application(self):
+        """Test that weights for each query position sum to 1 (softmax)."""
+        attn_weights = dot_product_attention_weights(
+            self.query, self.key, deterministic=True, dtype=self.dtype
+        )
+        sums = jnp.sum(attn_weights, axis=-1)
+        np.testing.assert_allclose(np.array(sums), np.ones(sums.shape), rtol=1e-6)
+
+    def test_masking(self):
+        """Test that masking works as expected."""
+        mask = jnp.ones((self.batch_size, self.num_heads, self.seq_len, self.seq_len), dtype=jnp.bool_)
+        mask = mask.at[:, :, :, -1].set(False)
+        
+        attn_weights = dot_product_attention_weights(
+            self.query, self.key, mask=mask, deterministic=True, dtype=self.dtype
+        )
+        
+        weights_for_last_key = attn_weights[:, :, :, -1]
+        np.testing.assert_allclose(np.array(weights_for_last_key), np.zeros_like(weights_for_last_key), atol=1e-7)
+        
+        sums = jnp.sum(attn_weights, axis=-1)
+        np.testing.assert_allclose(np.array(sums), np.ones(sums.shape), rtol=1e-6)
+
+    def test_bias(self):
+        """Test the application of an attention bias."""
+        bias_val = 100.0
+        bias = jnp.zeros((self.batch_size, self.num_heads, self.seq_len, self.seq_len))
+        bias = bias.at[:, :, :, 0].set(bias_val)
+        
+        attn_weights = dot_product_attention_weights(
+            self.query, self.key, bias=bias, deterministic=True, dtype=self.dtype
+        )
+        
+        weights_for_first_key = attn_weights[:, :, :, 0]
+        np.testing.assert_allclose(np.array(weights_for_first_key), np.ones_like(weights_for_first_key), rtol=1e-6)
+
+    def test_dropout_non_deterministic(self):
+        """Test that dropout is applied in non-deterministic mode."""
+        dropout_rate = 0.5
+        key1, key2 = jax.random.split(self.dropout_key)
+        
+        weights1 = dot_product_attention_weights(
+            self.query, self.key, dropout_rng=key1, dropout_rate=dropout_rate, deterministic=False
+        )
+        weights2 = dot_product_attention_weights(
+            self.query, self.key, dropout_rng=key2, dropout_rate=dropout_rate, deterministic=False
+        )
+        
+        self.assertFalse(jnp.allclose(weights1, weights2))
+
+    def test_dropout_deterministic(self):
+        """Test that dropout is NOT applied in deterministic mode."""
+        dropout_rate = 0.5
+        key1, key2 = jax.random.split(self.dropout_key)
+        
+        weights1 = dot_product_attention_weights(
+            self.query, self.key, dropout_rng=key1, dropout_rate=dropout_rate, deterministic=True
+        )
+        weights2 = dot_product_attention_weights(
+            self.query, self.key, dropout_rng=key2, dropout_rate=dropout_rate, deterministic=True
+        )
+        
+        np.testing.assert_allclose(np.array(weights1), np.array(weights2))
+
+    def test_broadcast_dropout(self):
+        """Test broadcast dropout behavior."""
+        query = jnp.ones((self.batch_size, self.num_heads, self.seq_len, self.head_dim))
+        key = jnp.ones((self.batch_size, self.num_heads, self.seq_len, self.head_dim))
+        
+        weights = dot_product_attention_weights(
+            query, key,
+            dropout_rng=self.dropout_key,
+            dropout_rate=0.5,
+            deterministic=False,
+            broadcast_dropout=True
+        )
+        
+        first_matrix = weights[0, 0]
+        for b in range(self.batch_size):
+            for h in range(self.num_heads):
+                np.testing.assert_allclose(np.array(weights[b, h]), np.array(first_matrix))
+
+    def test_no_broadcast_dropout(self):
+        """Test non-broadcast dropout behavior."""
+        query = jnp.ones((self.batch_size, self.num_heads, self.seq_len, self.head_dim))
+        key = jnp.ones((self.batch_size, self.num_heads, self.seq_len, self.head_dim))
+        
+        weights = dot_product_attention_weights(
+            query, key,
+            dropout_rng=self.dropout_key,
+            dropout_rate=0.5,
+            deterministic=False,
+            broadcast_dropout=False
+        )
+        
+        self.assertFalse(jnp.allclose(weights[0, 0], weights[1, 1]))
+
+    def test_sow_weights(self):
+        """Test if attention weights are sown correctly."""
+        class TestModule(nnx.Module):
+            def __init__(self, *, rngs):
+                pass
+            def __call__(self, query, key):
+                return dot_product_attention_weights(
+                    query, key, module=self, deterministic=True
+                )
+
+        module = TestModule(rngs=nnx.Rngs(0))
+        weights = module(self.query, self.key)
+        
+        state = nnx.state(module, nnx.Intermediate)
+        
+        self.assertIn('attn_weights', state)
+        
+        sown_weights_list = state['attn_weights'].value
+        self.assertIsInstance(sown_weights_list, tuple)
+        self.assertEqual(len(sown_weights_list), 1)
+        sown_weights = sown_weights_list[0]
+        
+        self.assertEqual(sown_weights.shape, weights.shape)
+        np.testing.assert_allclose(np.array(sown_weights), np.array(weights))
 
 if __name__ == '__main__':
     unittest.main() 
