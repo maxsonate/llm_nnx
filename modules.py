@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import math
 from typing import Any, Callable, Sequence
 
 import flax.linen as nn
@@ -19,7 +20,7 @@ import numpy as np
 from flax.nnx.nn import dtypes
 from flax.nnx.nn.normalization import LayerNorm
 from flax.nnx.module import first_from
-from flax.nnx.nn.attention import dot_product_attention
+
 
 from configs import default
 
@@ -246,6 +247,225 @@ class MlpBlock(nnx.Module):
     output = self.linear2(x)
     output = self.dropout(output, rngs=rngs)
     return output
+
+
+def combine_masks(
+    *masks: Array | None,
+    dtype: Dtype = jnp.bool_,
+) -> Array | None:
+  """Combine multiple attention masks into a single mask.
+  
+  Args:
+    *masks: Variable number of attention masks to combine. None values are ignored.
+    dtype: Data type for the combined mask. Defaults to jnp.bool_.
+    
+  Returns:
+    Combined mask using logical AND operation, or None if no valid masks provided.
+  """
+  # Filter out None masks
+  mask_list = [mask for mask in masks if mask is not None]
+  if not mask_list:
+    return None
+  
+  # Validate all masks have the same number of dimensions
+  first_mask_ndim = mask_list[0].ndim
+  mask_ndims = [mask.ndim for mask in mask_list]
+  
+  assert all(ndim == first_mask_ndim for ndim in mask_ndims), (
+    f'All masks should have the same rank. '
+    f'Expected: {first_mask_ndim}, got: {mask_ndims}'
+  )
+
+  # Combine masks using logical AND
+  mask, *rest = mask_list
+  for next_mask in rest:
+    mask = jnp.logical_and(mask, next_mask)
+
+  return mask.astype(dtype)
+
+
+
+
+def dot_product_attention_weights(
+  query: Array,
+  key: Array,
+  bias: Array | None = None,
+  mask: Array | None = None,
+  broadcast_dropout: bool = True,
+  dropout_rng: Array | None = None,
+  dropout_rate: float = 0.0,
+  deterministic: bool = False,
+  dtype: Dtype | None = None,
+  precision: PrecisionLike = None,
+  module: nnx.Module | None = None,
+  promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+):
+  """Computes dot-product attention weights.
+
+  Args:
+    query: query tensor.
+    key: key tensor.
+    bias: bias for the attention weights. This should be broadcastable to the
+      shape `[..., num_heads, query_length, key_length]`.
+    mask: boolean mask for the attention weights. This should be broadcastable
+      to the shape `[..., num_heads, query_length, key_length]`.
+    broadcast_dropout: bool: use a broadcasted dropout along batch dims.
+    dropout_rng: JAX PRNGKey: to be used for dropout
+    dropout_rate: dropout rate
+    deterministic: bool, deterministic or not (to apply dropout)
+    dtype: the dtype of the computation (default: infer from inputs)
+    precision: numerical precision of the computation see `jax.lax.Precision`
+      for details.
+    module: the Module that will sow the attention weights.
+    promote_dtype: function to promote dtypes.
+
+  Returns:
+    Output of shape `[..., num_heads, query_length, key_length]`.
+  """
+  
+  query, key = promote_dtype((query, key), dtype=dtype)
+
+  dtype = query.dtype
+
+  assert query.ndim == key.ndim, 'q, k must have same rank.'
+  assert query.shape[:-3] == key.shape[:-3], 'q, k batch dims must match.'
+  assert query.shape[-2] == key.shape[-2], 'q, k num_heads must match.'
+  assert query.shape[-1] == key.shape[-1], 'q, k depths must match.'  
+
+
+    # calculate attention matrix  
+  depth = query.shape[-1]
+
+  query = query / jnp.sqrt(depth).astype(dtype)
+
+  attn_weights = jnp.einsum('...qhd,...khd->...hqk', query, key, precision=precision)
+
+  if bias is not None:
+    attn_weights = attn_weights + bias
+
+  if mask is not None:
+    neg_inf = jnp.finfo(dtype).min
+    attn_weights = jnp.where(mask, attn_weights, neg_inf)
+
+  
+  attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+  if module is not None:
+    module.sow(nnx.Intermediate, 'attn_weights', attn_weights
+          )
+    
+  if not deterministic and dropout_rate > 0:
+    keep_prob = 1 - dropout_rate
+  
+    if broadcast_dropout:
+      dropout_shape = (1,) * (attn_weights.ndim - 2) + attn_weights.shape[-2:]
+      keep = jax.random.bernoulli(dropout_rng, keep_prob, dropout_shape)
+    else:
+      keep = jax.random.bernoulli(dropout_rng, keep_prob, attn_weights.shape)
+    
+    multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype)
+
+    attn_weights = attn_weights * multiplier
+
+  return attn_weights
+
+
+def dot_product_attention(
+  query: Array,
+  key: Array,
+  value: Array,
+  bias: Array | None = None,
+  mask: Array | None = None,
+  broadcast_dropout: bool = True,
+  dropout_rng: Array | None = None,
+  dropout_rate: float = 0.0,
+  deterministic: bool = False,
+  dtype: Dtype | None = None,
+  precision: PrecisionLike = None,
+  module: nnx.Module | None = None,
+  promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+):
+  """Computes dot-product attention on the given ``query``, ``key`` and
+  ``value`` tensors and returns the attention output.
+
+  This is a convenience wrapper around :pyfunc:`dot_product_attention_weights`
+  that first computes the attention weights and then applies them to the
+  ``value`` tensor via an einsum.  It mirrors the semantics of
+  :pyfunc:`jax.nn.dot_product_attention` while providing additional
+  functionality such as:
+
+    • Optional dropout with support for broadcasting across batch/head dims.
+    • Boolean masking of invalid key positions.
+    • Automatic dtype promotion for mixed-precision training.
+    • Optional recording (``sow``-ing) of the intermediate attention
+      weights for later inspection.
+
+  Args:
+    query: Array of shape ``(..., query_length, num_heads, head_dim)`` — the
+      queries.
+    key: Array of shape ``(..., key_length, num_heads, head_dim)`` — the
+      keys.
+    value: Array of shape ``(..., key_length, num_heads, head_dim)`` — the
+      values.
+    bias: Optional array broadcastable to
+      ``(..., num_heads, query_length, key_length)`` providing an additive
+      bias term (e.g. relative positional bias).
+    mask: Optional boolean array broadcastable to the same shape as ``bias``.
+      ``True`` entries are kept while ``False`` entries are masked out.
+    broadcast_dropout: Whether dropout masks are broadcast across the batch
+      and head dimensions.
+    dropout_rng: PRNGKey used for stochastic dropout when
+      ``deterministic`` is ``False``.
+    dropout_rate: Probability of dropping an attention weight.  A value of
+      ``0.0`` disables dropout.
+    deterministic: Disables dropout when set to ``True`` regardless of
+      ``dropout_rate``.
+    dtype: Optional computation dtype.  If ``None``, the dtype is inferred
+      from the inputs.
+    precision: XLA computation precision for the underlying einsum.
+    module: Optional ``nnx.Module`` used to record (``sow``) the attention
+      weights.
+    promote_dtype: Callable that promotes the dtypes of the inputs prior to
+      the computation.
+
+  Returns:
+    Array of shape ``(..., query_length, num_heads, head_dim)`` containing
+    the attended values.
+  """
+
+  query, key, value = promote_dtype((query, key, value), dtype=dtype)
+
+  dtype = query.dtype
+
+  assert query.ndim == key.ndim == value.ndim, 'q, k, v must have same rank.'
+  assert query.shape[:-3] == key.shape[:-3], 'q, k batch dims must match.'
+  assert query.shape[-2] == key.shape[-2], 'q, k num_heads must match.'
+  assert query.shape[-1] == key.shape[-1], 'q, k depths must match.'
+  assert query.shape[-1] == value.shape[-1], 'q, v depths must match.'
+
+  if dropout_rate == 0 and module is None:
+    query_shape = query.shape
+    
+    if len(query_shape) > 4:
+      def reshape_4d(x):
+        return jnp.reshape(x, (math.prod(query_shape[:-3]), *query_shape[-3:]))
+    
+      query, key, value, bias, mask = jax.tree.map(reshape_4d, (query, key, value, bias, mask))
+
+    if mask is not None:
+      mask = mask.astype(jnp.bool_)
+    
+    out = jax.nn.dot_product_attention(query, key, value, bias, mask)
+
+    if len(query_shape) > 4:
+      out = jnp.reshape(out, query_shape)
+
+    return out
+
+  attn_weights = dot_product_attention_weights(
+    query, key, bias, mask, broadcast_dropout, dropout_rng, dropout_rate, deterministic, dtype, precision, module, promote_dtype
+  )
+
+  return jnp.einsum('...hqk,...khd->...qhd', attn_weights, value, precision=precision)
 
 
 class MultiHeadAttention(nnx.Module):
@@ -539,126 +759,3 @@ class MultiHeadAttention(nnx.Module):
     output = self.out_proj(attn)
 
     return output
-
-
-def combine_masks(
-    *masks: Array | None,
-    dtype: Dtype = jnp.bool_,
-) -> Array | None:
-  """Combine multiple attention masks into a single mask.
-  
-  Args:
-    *masks: Variable number of attention masks to combine. None values are ignored.
-    dtype: Data type for the combined mask. Defaults to jnp.bool_.
-    
-  Returns:
-    Combined mask using logical AND operation, or None if no valid masks provided.
-  """
-  # Filter out None masks
-  mask_list = [mask for mask in masks if mask is not None]
-  if not mask_list:
-    return None
-  
-  # Validate all masks have the same number of dimensions
-  first_mask_ndim = mask_list[0].ndim
-  mask_ndims = [mask.ndim for mask in mask_list]
-  
-  assert all(ndim == first_mask_ndim for ndim in mask_ndims), (
-    f'All masks should have the same rank. '
-    f'Expected: {first_mask_ndim}, got: {mask_ndims}'
-  )
-
-  # Combine masks using logical AND
-  mask, *rest = mask_list
-  for next_mask in rest:
-    mask = jnp.logical_and(mask, next_mask)
-
-  return mask.astype(dtype)
-
-
-
-
-def dot_product_attention_weights(
-  query: Array,
-  key: Array,
-  bias: Array | None = None,
-  mask: Array | None = None,
-  broadcast_dropout: bool = True,
-  dropout_rng: Array | None = None,
-  dropout_rate: float = 0.0,
-  deterministic: bool = False,
-  dtype: Dtype | None = None,
-  precision: PrecisionLike = None,
-  module: nnx.Module | None = None,
-  promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-):
-  """Computes dot-product attention weights.
-
-  Args:
-    query: query tensor.
-    key: key tensor.
-    bias: bias for the attention weights. This should be broadcastable to the
-      shape `[..., num_heads, query_length, key_length]`.
-    mask: boolean mask for the attention weights. This should be broadcastable
-      to the shape `[..., num_heads, query_length, key_length]`.
-    broadcast_dropout: bool: use a broadcasted dropout along batch dims.
-    dropout_rng: JAX PRNGKey: to be used for dropout
-    dropout_rate: dropout rate
-    deterministic: bool, deterministic or not (to apply dropout)
-    dtype: the dtype of the computation (default: infer from inputs)
-    precision: numerical precision of the computation see `jax.lax.Precision`
-      for details.
-    module: the Module that will sow the attention weights.
-    promote_dtype: function to promote dtypes.
-
-  Returns:
-    Output of shape `[..., num_heads, query_length, key_length]`.
-  """
-  
-  query, key = promote_dtype((query, key), dtype=dtype)
-
-  dtype = query.dtype
-
-  assert query.ndim == key.ndim, 'q, k must have same rank.'
-  assert query.shape[:-3] == key.shape[:-3], 'q, k batch dims must match.'
-  assert query.shape[-2] == key.shape[-2], 'q, k num_heads must match.'
-  assert query.shape[-1] == key.shape[-1], 'q, k depths must match.'  
-
-
-    # calculate attention matrix  
-  depth = query.shape[-1]
-
-  query = query / jnp.sqrt(depth).astype(dtype)
-
-  attn_weights = jnp.einsum('...qhd,...khd->...hqk', query, key, precision=precision)
-
-  if bias is not None:
-    attn_weights = attn_weights + bias
-
-  if mask is not None:
-    neg_inf = jnp.finfo(dtype).min
-    attn_weights = jnp.where(mask, attn_weights, neg_inf)
-
-  
-  attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-  if module is not None:
-    module.sow(nnx.Intermediate, 'attn_weights', attn_weights
-          )
-    
-  if not deterministic and dropout_rate > 0:
-    keep_prob = 1 - dropout_rate
-  
-    if broadcast_dropout:
-      dropout_shape = (1,) * (attn_weights.ndim - 2) + attn_weights.shape[-2:]
-      keep = jax.random.bernoulli(dropout_rng, keep_prob, dropout_shape)
-    else:
-      keep = jax.random.bernoulli(dropout_rng, keep_prob, attn_weights.shape)
-    
-    multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype)
-
-    attn_weights = attn_weights * multiplier
-
-  return attn_weights
-
-
-

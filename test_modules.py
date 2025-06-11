@@ -8,7 +8,7 @@ from flax import nnx # For new tests
 from modules import (
     shift_right, shift_inputs, sinusoidal_init, 
     TransformerConfig, AddPositionEmbs, MlpBlock, MultiHeadAttention, Shape,
-    dot_product_attention_weights,
+    dot_product_attention_weights, dot_product_attention, combine_masks,
 )
 
 class TestModelFunctions(unittest.TestCase):
@@ -693,6 +693,344 @@ class TestDotProductAttentionWeights(unittest.TestCase):
         
         self.assertEqual(sown_weights.shape, weights.shape)
         np.testing.assert_allclose(np.array(sown_weights), np.array(weights))
+
+class TestCombineMasks(unittest.TestCase):
+    """Test the combine_masks function."""
+
+    def setUp(self):
+        self.batch_size = 2
+        self.num_heads = 2 
+        self.seq_len = 4
+        self.mask_shape = (self.batch_size, self.num_heads, self.seq_len, self.seq_len)
+
+    def test_no_masks(self):
+        """Test that combine_masks returns None when no masks are provided."""
+        result = combine_masks()
+        self.assertIsNone(result)
+
+    def test_single_mask(self):
+        """Test that combine_masks returns the single mask when only one is provided."""
+        mask = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        result = combine_masks(mask)
+        np.testing.assert_array_equal(np.array(result), np.array(mask))
+        self.assertEqual(result.dtype, jnp.bool_)
+
+    def test_single_mask_with_nones(self):
+        """Test that combine_masks ignores None values."""
+        mask = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        result = combine_masks(None, mask, None)
+        np.testing.assert_array_equal(np.array(result), np.array(mask))
+
+    def test_two_masks_logical_and(self):
+        """Test that combine_masks performs logical AND on two masks."""
+        mask1 = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        mask2 = jnp.zeros(self.mask_shape, dtype=jnp.bool_)
+        mask2 = mask2.at[:, :, 0, :].set(True)  # First row is True
+        
+        result = combine_masks(mask1, mask2)
+        expected = jnp.logical_and(mask1, mask2)
+        
+        np.testing.assert_array_equal(np.array(result), np.array(expected))
+        self.assertEqual(result.dtype, jnp.bool_)
+
+    def test_multiple_masks(self):
+        """Test that combine_masks works with multiple masks."""
+        mask1 = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        mask2 = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        mask2 = mask2.at[:, :, -1, :].set(False)  # Last row is False
+        mask3 = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        mask3 = mask3.at[:, :, :, -1].set(False)  # Last column is False
+        
+        result = combine_masks(mask1, mask2, mask3)
+        expected = jnp.logical_and(jnp.logical_and(mask1, mask2), mask3)
+        
+        np.testing.assert_array_equal(np.array(result), np.array(expected))
+
+    def test_different_dtypes(self):
+        """Test that combine_masks converts to the specified dtype."""
+        mask1 = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        mask2 = jnp.ones(self.mask_shape, dtype=jnp.bool_)
+        
+        result_float = combine_masks(mask1, mask2, dtype=jnp.float32)
+        result_int = combine_masks(mask1, mask2, dtype=jnp.int32)
+        
+        self.assertEqual(result_float.dtype, jnp.float32)
+        self.assertEqual(result_int.dtype, jnp.int32)
+        np.testing.assert_array_equal(np.array(result_float), np.ones(self.mask_shape, dtype=jnp.float32))
+        np.testing.assert_array_equal(np.array(result_int), np.ones(self.mask_shape, dtype=jnp.int32))
+
+    def test_mismatched_dimensions(self):
+        """Test that combine_masks raises error for masks with different dimensions."""
+        mask1 = jnp.ones((2, 2, 4, 4), dtype=jnp.bool_)  # 4D
+        mask2 = jnp.ones((2, 4, 4), dtype=jnp.bool_)     # 3D
+        
+        with self.assertRaises(AssertionError):
+            combine_masks(mask1, mask2)
+
+    def test_broadcastable_shapes(self):
+        """Test that combine_masks works with broadcastable shapes."""
+        mask1 = jnp.ones((2, 2, 4, 4), dtype=jnp.bool_)
+        mask2 = jnp.ones((1, 1, 4, 4), dtype=jnp.bool_)  # Broadcastable
+        mask2 = mask2.at[:, :, 0, :].set(False)
+        
+        result = combine_masks(mask1, mask2)
+        expected = jnp.logical_and(mask1, mask2)
+        
+        np.testing.assert_array_equal(np.array(result), np.array(expected))
+
+
+class TestDotProductAttention(unittest.TestCase):
+    """Test the dot_product_attention function."""
+
+    def setUp(self):
+        self.key = jax.random.key(42)
+        self.batch_size = 2
+        self.num_heads = 2
+        self.seq_len = 4
+        self.head_dim = 8
+
+        q_key, k_key, v_key, self.dropout_key = jax.random.split(self.key, 4)
+        self.query = jax.random.normal(q_key, (self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        self.key_tensor = jax.random.normal(k_key, (self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        self.value = jax.random.normal(v_key, (self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        self.dtype = jnp.float32
+
+    def test_basic_output_shape(self):
+        """Test that dot_product_attention returns correct output shape."""
+        output = dot_product_attention(
+            self.query, self.key_tensor, self.value, 
+            deterministic=True, dtype=self.dtype
+        )
+        expected_shape = (self.batch_size, self.seq_len, self.num_heads, self.head_dim)
+        self.assertEqual(output.shape, expected_shape)
+
+    def test_self_attention(self):
+        """Test self-attention (query, key, value are the same)."""
+        inputs = self.query
+        output = dot_product_attention(
+            inputs, inputs, inputs, 
+            deterministic=True, dtype=self.dtype
+        )
+        self.assertEqual(output.shape, inputs.shape)
+
+    def test_cross_attention(self):
+        """Test cross-attention with different query and key/value."""
+        # Different sequence length for key/value
+        kv_seq_len = 6
+        k_key, v_key = jax.random.split(jax.random.key(123), 2)
+        key_cross = jax.random.normal(k_key, (self.batch_size, kv_seq_len, self.num_heads, self.head_dim))
+        value_cross = jax.random.normal(v_key, (self.batch_size, kv_seq_len, self.num_heads, self.head_dim))
+        
+        output = dot_product_attention(
+            self.query, key_cross, value_cross,
+            deterministic=True, dtype=self.dtype
+        )
+        expected_shape = (self.batch_size, self.seq_len, self.num_heads, self.head_dim)  # Query length
+        self.assertEqual(output.shape, expected_shape)
+
+    def test_masking_effect(self):
+        """Test that masking affects the output."""
+        # Create a mask that blocks the last key position
+        mask = jnp.ones((self.batch_size, self.num_heads, self.seq_len, self.seq_len), dtype=jnp.bool_)
+        mask = mask.at[:, :, :, -1].set(False)
+        
+        output_masked = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            mask=mask, deterministic=True, dtype=self.dtype
+        )
+        
+        output_unmasked = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            deterministic=True, dtype=self.dtype
+        )
+        
+        # Outputs should be different when masking is applied
+        self.assertFalse(jnp.allclose(output_masked, output_unmasked, atol=1e-6))
+
+    def test_bias_application(self):
+        """Test that bias affects the attention computation."""
+        bias = jnp.zeros((self.batch_size, self.num_heads, self.seq_len, self.seq_len))
+        bias = bias.at[:, :, :, 0].set(100.0)  # Strong bias toward first position
+        
+        output_biased = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            bias=bias, deterministic=True, dtype=self.dtype
+        )
+        
+        output_unbiased = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            deterministic=True, dtype=self.dtype
+        )
+        
+        # Outputs should be different when bias is applied
+        self.assertFalse(jnp.allclose(output_biased, output_unbiased, atol=1e-6))
+
+    def test_dropout_deterministic_vs_non_deterministic(self):
+        """Test dropout behavior in deterministic vs non-deterministic modes."""
+        dropout_rate = 0.5
+        
+        # Deterministic mode should give same results
+        output1_det = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            dropout_rng=jax.random.key(1), dropout_rate=dropout_rate,
+            deterministic=True, dtype=self.dtype
+        )
+        output2_det = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            dropout_rng=jax.random.key(2), dropout_rate=dropout_rate,
+            deterministic=True, dtype=self.dtype
+        )
+        np.testing.assert_allclose(np.array(output1_det), np.array(output2_det))
+        
+        # Non-deterministic mode should give different results
+        output1_nondet = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            dropout_rng=jax.random.key(1), dropout_rate=dropout_rate,
+            deterministic=False, dtype=self.dtype
+        )
+        output2_nondet = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            dropout_rng=jax.random.key(2), dropout_rate=dropout_rate,
+            deterministic=False, dtype=self.dtype
+        )
+        self.assertFalse(jnp.allclose(output1_nondet, output2_nondet, atol=1e-6))
+
+    def test_no_dropout_efficiency_path(self):
+        """Test the efficiency path when dropout_rate=0 and module=None."""
+        # This should use the optimized jax.nn.dot_product_attention path
+        output_efficient = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            dropout_rate=0.0, deterministic=True, dtype=self.dtype
+        )
+        
+        # Compare with explicit dropout path
+        output_explicit = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            dropout_rate=0.001, deterministic=True, dtype=self.dtype  # Small dropout to avoid efficient path
+        )
+        
+        # Should have same shape and similar values (though not exactly equal due to different code paths)
+        self.assertEqual(output_efficient.shape, output_explicit.shape)
+
+    def test_broadcast_dropout(self):
+        """Test broadcast dropout functionality."""
+        dropout_rate = 0.5
+        
+        # Use identical inputs to ensure dropout is the only source of variation
+        query = jnp.ones((self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        key = jnp.ones((self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        value = jnp.ones((self.batch_size, self.seq_len, self.num_heads, self.head_dim))
+        
+        output_broadcast = dot_product_attention(
+            query, key, value,
+            dropout_rng=self.dropout_key, dropout_rate=dropout_rate,
+            broadcast_dropout=True, deterministic=False, dtype=self.dtype
+        )
+        
+        output_no_broadcast = dot_product_attention(
+            query, key, value, 
+            dropout_rng=self.dropout_key, dropout_rate=dropout_rate,
+            broadcast_dropout=False, deterministic=False, dtype=self.dtype
+        )
+        
+        # Both should have same shape
+        self.assertEqual(output_broadcast.shape, output_no_broadcast.shape)
+
+    def test_higher_dimensional_inputs(self):
+        """Test attention with higher-dimensional inputs (>4D)."""
+        # 5D inputs: (batch, time, head, seq, features)
+        batch_dims = (2, 3)  # Extra batch dimensions
+        query_5d = jax.random.normal(
+            jax.random.key(1), 
+            batch_dims + (self.seq_len, self.num_heads, self.head_dim)
+        )
+        key_5d = jax.random.normal(
+            jax.random.key(2), 
+            batch_dims + (self.seq_len, self.num_heads, self.head_dim)
+        )
+        value_5d = jax.random.normal(
+            jax.random.key(3), 
+            batch_dims + (self.seq_len, self.num_heads, self.head_dim)
+        )
+        
+        output = dot_product_attention(
+            query_5d, key_5d, value_5d,
+            deterministic=True, dtype=self.dtype
+        )
+        
+        expected_shape = batch_dims + (self.seq_len, self.num_heads, self.head_dim)
+        self.assertEqual(output.shape, expected_shape)
+
+    def test_dimension_validation(self):
+        """Test that mismatched dimensions raise appropriate errors."""
+        # Mismatched rank
+        query_3d = jnp.ones((self.batch_size, self.seq_len, self.head_dim))  # Missing head dim
+        
+        with self.assertRaises(AssertionError):
+            dot_product_attention(query_3d, self.key_tensor, self.value, deterministic=True)
+        
+        # Mismatched batch dimensions
+        query_wrong_batch = jnp.ones((3, self.seq_len, self.num_heads, self.head_dim))  # Wrong batch size
+        
+        with self.assertRaises(AssertionError):
+            dot_product_attention(query_wrong_batch, self.key_tensor, self.value, deterministic=True)
+        
+        # Mismatched head dimensions
+        key_wrong_heads = jnp.ones((self.batch_size, self.seq_len, 3, self.head_dim))  # Wrong num_heads
+        
+        with self.assertRaises(AssertionError):
+            dot_product_attention(self.query, key_wrong_heads, self.value, deterministic=True)
+        
+        # Mismatched feature dimensions
+        value_wrong_features = jnp.ones((self.batch_size, self.seq_len, self.num_heads, 16))  # Wrong head_dim
+        
+        with self.assertRaises(AssertionError):
+            dot_product_attention(self.query, self.key_tensor, value_wrong_features, deterministic=True)
+
+    def test_attention_weights_recording(self):
+        """Test that attention weights can be recorded with module.sow."""
+        class TestModule(nnx.Module):
+            def __init__(self, *, rngs):
+                pass
+                
+            def __call__(self, query, key, value):
+                return dot_product_attention(
+                    query, key, value, module=self, deterministic=True
+                )
+        
+        module = TestModule(rngs=nnx.Rngs(0))
+        output = module(self.query, self.key_tensor, self.value)
+        
+        # Check that attention weights were sown
+        state = nnx.state(module, nnx.Intermediate)
+        self.assertIn('attn_weights', state)
+        
+        sown_weights_list = state['attn_weights'].value
+        self.assertIsInstance(sown_weights_list, tuple)
+        self.assertEqual(len(sown_weights_list), 1)
+        
+        sown_weights = sown_weights_list[0]
+        expected_weights_shape = (self.batch_size, self.num_heads, self.seq_len, self.seq_len)
+        self.assertEqual(sown_weights.shape, expected_weights_shape)
+
+    def test_precision_parameter(self):
+        """Test that precision parameter is accepted and doesn't break computation."""
+        output_default = dot_product_attention(
+            self.query, self.key_tensor, self.value, 
+            deterministic=True, dtype=self.dtype
+        )
+        
+        output_high_precision = dot_product_attention(
+            self.query, self.key_tensor, self.value,
+            precision=jax.lax.Precision.HIGHEST,
+            deterministic=True, dtype=self.dtype
+        )
+        
+        # Should have same shape and similar values
+        self.assertEqual(output_default.shape, output_high_precision.shape)
+        # Values should be close but might not be exactly equal due to precision differences
+        self.assertTrue(jnp.allclose(output_default, output_high_precision, rtol=1e-5))
+
 
 if __name__ == '__main__':
     unittest.main() 
