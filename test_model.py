@@ -6,7 +6,7 @@ from flax import nnx
 
 # Import from modules and model
 from modules import TransformerConfig
-from model import EncoderDecoder1DBlock
+from model import EncoderDecoder1DBlock, Decoder
 
 
 class TestEncoderDecoder1DBlock(unittest.TestCase):
@@ -115,6 +115,83 @@ class TestEncoderDecoder1DBlock(unittest.TestCase):
         # With zero inputs and zero-initialized weights, outputs should be close to inputs
         # due to residual connections
         self.assertEqual(outputs.shape, inputs.shape)
+
+
+class TestDecoder(unittest.TestCase):
+
+    def setUp(self):
+        self.config = TransformerConfig(
+            vocab_size=100,
+            output_vocab_size=120,
+            emb_dim=8,
+            max_len=10,
+            num_heads=2,
+            num_layers=2,
+            qkv_dim=8,
+            mlp_dim=16,
+            dropout_rate=0.1,
+            attention_dropout_rate=0.1,
+            logits_via_embedding=False
+        )
+        self.rngs = nnx.Rngs(params=jax.random.key(0), dropout=jax.random.key(1))
+
+    def test_output_shape(self):
+        """Test that Decoder output has the correct shape."""
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        
+        decoder = Decoder(config=self.config, decode=False, rngs=self.rngs)
+        outputs = decoder(inputs, rngs=nnx.Rngs(dropout=jax.random.key(2)))
+        
+        expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
+        self.assertEqual(outputs.shape, expected_shape)
+
+    def test_decode_mode_output_shape(self):
+        """Test Decoder output shape in decode mode."""
+        batch_size, seq_len = 2, 1  # Typical for decode mode
+        inputs = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        
+        decoder = Decoder(config=self.config, decode=True, rngs=self.rngs)
+        decoder.init_cache(batch_size)
+        outputs = decoder(inputs, rngs=nnx.Rngs(dropout=jax.random.key(2)))
+        
+        expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
+        self.assertEqual(outputs.shape, expected_shape)
+
+    def test_logits_via_embedding(self):
+        """Test Decoder with logits_via_embedding=True."""
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        
+        config_logits = self.config.replace(logits_via_embedding=True)
+        decoder = Decoder(config=config_logits, decode=False, rngs=self.rngs)
+        outputs = decoder(inputs, rngs=nnx.Rngs(dropout=jax.random.key(2)))
+        
+        expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
+        self.assertEqual(outputs.shape, expected_shape)
+
+    def test_shared_embedding(self):
+        """Test Decoder with a shared embedding layer."""
+        batch_size, seq_len = 2, 5
+        inputs = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+
+        shared_embedding = nnx.Embed(
+            num_embeddings=self.config.output_vocab_size,
+            features=self.config.emb_dim,
+            rngs=self.rngs
+        )
+        
+        decoder = Decoder(
+            config=self.config,
+            shared_embedding=shared_embedding,
+            decode=False,
+            rngs=self.rngs
+        )
+        outputs = decoder(inputs, rngs=nnx.Rngs(dropout=jax.random.key(2)))
+
+        self.assertIs(decoder.output_embed, shared_embedding)
+        expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
+        self.assertEqual(outputs.shape, expected_shape)
 
 
 if __name__ == '__main__':

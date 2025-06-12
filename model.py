@@ -1,7 +1,7 @@
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from modules import TransformerConfig, MlpBlock, MultiHeadAttention
+from modules import TransformerConfig, MlpBlock, MultiHeadAttention, AddPositionEmbs, shift_inputs
 
 
 class EncoderDecoder1DBlock(nnx.Module):
@@ -102,3 +102,135 @@ class EncoderDecoder1DBlock(nnx.Module):
     z = self.ln2(x)
     z = self.mlp(z, rngs=rngs)
     return x + z
+
+
+class Decoder(nnx.Module):
+  """Transformer Model Decoder for sequence to sequence translation.
+
+  Args:
+    config: TransformerConfig dataclass containing hyperparameters.
+    shared_embedding: a shared embedding layer to use.
+  """
+
+  def __init__(
+    self,
+    config: TransformerConfig,
+    shared_embedding: nnx.Embed | None = None,
+    *,
+    decode: bool = False,
+    rngs: nnx.Rngs,
+  ):
+    self.config = config
+    self.decode = decode
+    self.shared_embedding = shared_embedding
+
+    # Target Embedding
+    if self.shared_embedding is None:
+      self.output_embed = nnx.Embed(
+        num_embeddings=config.output_vocab_size,
+        features=config.emb_dim,
+        embedding_init=nnx.with_partitioning(
+          nnx.initializers.normal(stddev=1.0),
+          config.axis_rules('vocab', 'embed'),
+        ),
+        rngs=rngs,
+      )
+    else:
+      self.output_embed = self.shared_embedding
+
+    self.posembed_output = AddPositionEmbs(config=config, rngs=rngs)
+    self.dropout = nnx.Dropout(rate=config.dropout_rate)
+    for idx in range(config.num_layers):
+      layer = EncoderDecoder1DBlock(
+        config=config, decode=decode, rngs=rngs
+      )
+      setattr(self, f'encoderdecoderblock_{idx}', layer)
+
+    self.encoderdecoder_norm = nnx.LayerNorm(
+      num_features=config.emb_dim,
+      dtype=config.dtype,
+      bias_init=nnx.with_partitioning(
+        nnx.initializers.zeros_init(), config.axis_rules('embed')
+      ),
+      scale_init=nnx.with_partitioning(
+        nnx.initializers.ones_init(), config.axis_rules('embed')
+      ),
+      rngs=rngs,
+    )
+    if not config.logits_via_embedding:
+      self.logitdense = nnx.Linear(
+        in_features=config.emb_dim,
+        out_features=config.output_vocab_size,
+        dtype=config.dtype,
+        kernel_init=nnx.with_partitioning(
+          config.kernel_init, config.axis_rules('embed', 'vocab')
+        ),
+        bias_init=nnx.with_partitioning(
+          config.bias_init, config.axis_rules('vocab')
+        ),
+        rngs=rngs,
+      )
+    else:
+      self.logitdense = None
+
+  def init_cache(self, batch_size):
+    """Initialize cache for autoregressive decoding."""
+    if self.decode:
+      # The shape of the tensor before it enters the attention layers.
+      input_shape = (batch_size, self.config.max_len, self.config.emb_dim)
+      for idx in range(self.config.num_layers):
+        layer = getattr(self, f'encoderdecoderblock_{idx}')
+        layer.init_cache(input_shape)
+
+  def __call__(
+    self,
+    inputs,
+    *,
+    inputs_positions=None,
+    inputs_segmentation=None,
+    decoder_mask=None,
+    rngs: nnx.Rngs | None = None,
+  ):
+    """Applies Transformer model on the inputs.
+
+    Args:
+      inputs: input data.
+      inputs_positions: input subsequence positions for packed examples.
+      inputs_segmentation: input segmentation info for packed examples.
+      decoder_mask: decoder self-attention mask.
+
+    Returns:
+      output of a transformer decoder.
+    """
+    config = self.config
+    assert inputs.ndim == 2  # (batch, len)
+
+    y = inputs.astype('int32')
+    if not self.decode:
+      y = shift_inputs(y, segment_ids=inputs_segmentation)
+    y = self.output_embed(y)
+    y = self.posembed_output(y, inputs_positions=inputs_positions)
+    y = self.dropout(y, rngs=rngs)
+
+    y = y.astype(config.dtype)
+
+    # Target-Input Decoder
+    for idx in range(config.num_layers):
+      # TODO(cgarciae): use a list of layers instead of getattr
+      layer: EncoderDecoder1DBlock = getattr(self, f'encoderdecoderblock_{idx}')
+      y = layer(
+        y,
+        decoder_mask=decoder_mask,
+        rngs=rngs,
+      )
+    y = self.encoderdecoder_norm(y)
+
+    # Decoded Logits
+    if self.logitdense:
+      logits = self.logitdense(y)
+    else:
+      # Use the transpose of embedding matrix for logit transform.
+      logits = self.output_embed.attend(y.astype(jnp.float32))
+      # Correctly normalize pre-softmax logits for this shared case.
+      logits = logits / jnp.sqrt(y.shape[-1])
+    return logits
