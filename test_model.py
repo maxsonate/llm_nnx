@@ -6,7 +6,7 @@ from flax import nnx
 
 # Import from modules and model
 from modules import TransformerConfig
-from model import EncoderDecoder1DBlock, Decoder
+from model import EncoderDecoder1DBlock, Decoder, TransformerLM
 
 
 class TestEncoderDecoder1DBlock(unittest.TestCase):
@@ -192,6 +192,100 @@ class TestDecoder(unittest.TestCase):
         self.assertIs(decoder.output_embed, shared_embedding)
         expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
         self.assertEqual(outputs.shape, expected_shape)
+
+
+class TestTransformerLM(unittest.TestCase):
+
+    def setUp(self):
+        self.config = TransformerConfig(
+            vocab_size=50,
+            output_vocab_size=50,
+            emb_dim=16,
+            max_len=20,
+            num_heads=4,
+            num_layers=2,
+            qkv_dim=16,
+            mlp_dim=32,
+            dropout_rate=0.1,
+            attention_dropout_rate=0.1,
+            logits_via_embedding=False
+        )
+        self.rngs = nnx.Rngs(params=jax.random.key(42), dropout=jax.random.key(43))
+
+    def test_output_shape_train(self):
+        """Test TransformerLM output shape during training."""
+        batch_size, seq_len = 2, 10
+        inputs = jax.random.randint(
+            jax.random.key(0), (batch_size, seq_len), 0, self.config.vocab_size
+        )
+        
+        model = TransformerLM(config=self.config, decode=False, rngs=self.rngs)
+        logits = model(inputs, rngs=nnx.Rngs(dropout=jax.random.key(2)))
+        
+        expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
+        self.assertEqual(logits.shape, expected_shape)
+
+    def test_output_shape_decode(self):
+        """Test TransformerLM output shape during decoding."""
+        batch_size, seq_len = 2, 1  # Single token for decoding
+        inputs = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+
+        model = TransformerLM(config=self.config, decode=True, rngs=self.rngs)
+        model.decoder.init_cache(batch_size)
+        
+        logits = model(inputs, rngs=nnx.Rngs(dropout=jax.random.key(2)))
+        
+        expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
+        self.assertEqual(logits.shape, expected_shape)
+
+    def test_padding_mask(self):
+        """Test that padding tokens do not affect non-padding tokens."""
+        batch_size, seq_len = 2, 5
+        # First sequence has padding, second does not
+        inputs = jnp.array([
+            [1, 2, 3, 0, 0],
+            [1, 2, 3, 4, 5]
+        ])
+        
+        config_det = self.config.replace(deterministic=True, dropout_rate=0.0, attention_dropout_rate=0.0)
+        model = TransformerLM(config=config_det, decode=False, rngs=self.rngs)
+        
+        # Get logits for inputs with padding
+        logits_padded = model(inputs, rngs=nnx.Rngs(dropout=jax.random.key(2)))
+        
+        # Get logits for inputs without padding
+        inputs_unpadded = inputs[:1, :3] # Take the non-padded part
+        
+        logits_unpadded = model(
+            inputs_unpadded, rngs=nnx.Rngs(dropout=jax.random.key(2))
+        )
+        
+        # The logits for the non-padded tokens should be very similar
+        # Allowing for small floating point differences
+        np.testing.assert_allclose(
+            np.array(logits_padded[0, :3]),
+            np.array(logits_unpadded[0]),
+            rtol=1e-5, atol=1e-5
+        )
+
+    def test_segmentation_mask(self):
+        """Test attention with segmentation."""
+        batch_size, seq_len = 1, 6
+        inputs = jnp.array([[1, 2, 3, 4, 5, 6]])
+        segmentation = jnp.array([[1, 1, 1, 2, 2, 2]])
+        
+        model = TransformerLM(config=self.config, decode=False, rngs=self.rngs)
+        
+        # This will fail if the segmentation mask is not applied correctly
+        # We are not checking for correctness of values, just that it runs
+        logits = model(
+            inputs,
+            inputs_segmentation=segmentation,
+            rngs=nnx.Rngs(dropout=jax.random.key(2))
+        )
+        
+        expected_shape = (batch_size, seq_len, self.config.output_vocab_size)
+        self.assertEqual(logits.shape, expected_shape)
 
 
 if __name__ == '__main__':

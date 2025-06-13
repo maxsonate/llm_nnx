@@ -234,3 +234,69 @@ class Decoder(nnx.Module):
       # Correctly normalize pre-softmax logits for this shared case.
       logits = logits / jnp.sqrt(y.shape[-1])
     return logits
+
+
+class TransformerLM(nnx.Module):
+  """Transformer pure decoder stack for language modelling.
+
+  Args:
+    config: TransformerConfig dataclass containing hyperparameters.
+  """
+
+  def __init__(
+    self, config: TransformerConfig, *, decode: bool = False, rngs: nnx.Rngs
+  ):
+    self.config = config
+    self.decode = decode
+    self.decoder = Decoder(config=config, shared_embedding=None, decode=decode, rngs=rngs)
+
+  def __call__(
+    self,
+    inputs,
+    *,
+    inputs_positions=None,
+    inputs_segmentation=None,
+    rngs: nnx.Rngs | None = None,
+  ):
+    """Applies TransformerLM on the inputs.
+
+    Args:
+      inputs: target data.
+      inputs_positions: input subsequence positions for packed examples.
+      inputs_segmentation: input segmentation info for packed examples.
+
+    Returns:
+      logits array from transformer decoder.
+    """
+    config = self.config
+
+    # Make padding attention masks.
+    if self.decode:
+      # for fast autoregressive decoding we use no decoder mask
+      decoder_mask = None
+    else:
+      decoder_mask = nnx.combine_masks(
+        nnx.make_attention_mask(inputs > 0, inputs > 0, dtype=config.dtype), # This is the padding mask
+        nnx.make_causal_mask(inputs, dtype=config.dtype),
+      )
+
+    # Add segmentation block-diagonal attention masks if using segmented data.
+    if inputs_segmentation is not None:
+      decoder_mask = nnx.combine_masks(
+        decoder_mask,
+        nnx.make_attention_mask(
+          inputs_segmentation,
+          inputs_segmentation,
+          jnp.equal,
+          dtype=config.dtype,
+        ),
+      )
+
+    logits = self.decoder(
+      inputs,
+      inputs_positions=inputs_positions,
+      inputs_segmentation=inputs_segmentation,
+      decoder_mask=decoder_mask,
+      rngs=rngs,
+    )
+    return logits.astype(self.config.dtype)
