@@ -5,11 +5,11 @@ import numpy as np
 
 # Import the functions directly - make sure this file is in the same directory as train.py
 try:
-    from train import rsqrt_schedule, create_learning_rate_schedule
+    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy
 except ImportError:
     import sys
     sys.path.append('.')
-    from train import rsqrt_schedule, create_learning_rate_schedule
+    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy
 
 
 class TestRsqrtSchedule:
@@ -149,6 +149,162 @@ class TestCreateLearningRateSchedule:
             if warmup_steps > 1:
                 lr_before_warmup = schedule(warmup_steps - 1)
                 assert lr_before_warmup < learning_rate
+
+
+class TestComputeWeightedCrossEntropy:
+    """Test cases for the compute_weighted_cross_entropy function."""
+    
+    def test_basic_cross_entropy(self):
+        """Test basic cross-entropy without smoothing or weights."""
+        import jax.numpy as jnp
+        
+        # Test data: 2 samples, 3 time steps, 4 classes
+        logits = jnp.array([[[1.0, 2.0, 0.5, 0.1],
+                             [0.1, 0.2, 3.0, 0.5], 
+                             [2.5, 0.1, 0.3, 1.0]],
+                            [[0.5, 1.5, 0.2, 2.0],
+                             [1.0, 0.1, 0.8, 2.5],
+                             [0.3, 2.2, 1.1, 0.4]]])
+        targets = jnp.array([[1, 2, 0],
+                             [3, 3, 1]])
+        
+        loss, norm_factor = compute_weighted_cross_entropy(logits, targets)
+        
+        # Check shapes and basic properties
+        assert loss.ndim == 0, "Loss should be a scalar (0-dim array)"
+        assert norm_factor == 6.0, f"Expected norm_factor=6.0 (2*3), got {norm_factor}"
+        assert loss > 0, "Loss should be positive"
+    
+    def test_label_smoothing_reduces_loss(self):
+        """Test that label smoothing reduces loss compared to no smoothing."""
+        import jax.numpy as jnp
+        
+        logits = jnp.array([[[1.0, 2.0, 0.5, 0.1],
+                             [0.1, 0.2, 3.0, 0.5]]])
+        targets = jnp.array([[1, 2]])
+        
+        loss_no_smooth, _ = compute_weighted_cross_entropy(logits, targets, label_smoothing=0.0)
+        loss_smooth, _ = compute_weighted_cross_entropy(logits, targets, label_smoothing=0.1)
+        
+        assert loss_smooth < loss_no_smooth, "Label smoothing should reduce loss"
+    
+    def test_weights_masking(self):
+        """Test that weights properly mask out certain positions."""
+        import jax.numpy as jnp
+        
+        logits = jnp.array([[[1.0, 2.0, 0.5, 0.1],
+                             [0.1, 0.2, 3.0, 0.5], 
+                             [2.5, 0.1, 0.3, 1.0]],
+                            [[0.5, 1.5, 0.2, 2.0],
+                             [1.0, 0.1, 0.8, 2.5],
+                             [0.3, 2.2, 1.1, 0.4]]])
+        targets = jnp.array([[1, 2, 0],
+                             [3, 3, 1]])
+        
+        # Mask out last position of first sample
+        weights = jnp.array([[1.0, 1.0, 0.0],
+                             [1.0, 1.0, 1.0]])
+        
+        loss, norm_factor = compute_weighted_cross_entropy(logits, targets, weights=weights)
+        
+        assert norm_factor == 5.0, f"Expected norm_factor=5.0 (weighted count), got {norm_factor}"
+        assert loss > 0, "Loss should be positive"
+    
+    def test_combined_smoothing_and_weights(self):
+        """Test label smoothing combined with weights."""
+        import jax.numpy as jnp
+        
+        logits = jnp.array([[[1.0, 2.0, 0.5, 0.1],
+                             [0.1, 0.2, 3.0, 0.5]]])
+        targets = jnp.array([[1, 2]])
+        weights = jnp.array([[1.0, 0.5]])  # Partial weight on second position
+        
+        loss, norm_factor = compute_weighted_cross_entropy(
+            logits, targets, weights=weights, label_smoothing=0.1
+        )
+        
+        assert norm_factor == 1.5, f"Expected norm_factor=1.5, got {norm_factor}"
+        assert loss > 0, "Loss should be positive"
+
+
+class TestComputeWeightedAccuracy:
+    """Test cases for the compute_weighted_accuracy function."""
+    
+    def test_basic_accuracy(self):
+        """Test basic accuracy computation without weights."""
+        import jax.numpy as jnp
+        
+        # Test data: 2 samples, 2 time steps, 3 classes
+        # Set up logits so we know the predictions
+        logits = jnp.array([[[0.1, 2.0, 0.5],   # argmax=1, target=1 ✓
+                             [3.0, 0.2, 0.1]],  # argmax=0, target=2 ✗
+                            [[0.5, 0.2, 2.5],   # argmax=2, target=2 ✓
+                             [1.5, 0.1, 0.3]]])# argmax=0, target=0 ✓
+        targets = jnp.array([[1, 2],
+                             [2, 0]])
+        
+        accuracy_sum, norm_factor = compute_weighted_accuracy(logits, targets)
+        
+        # Should have 3 correct out of 4 predictions
+        assert accuracy_sum.ndim == 0, "Accuracy sum should be scalar"
+        assert accuracy_sum == 3.0, f"Expected 3 correct predictions, got {accuracy_sum}"
+        assert norm_factor == 4.0, f"Expected norm_factor=4.0, got {norm_factor}"
+    
+    def test_perfect_accuracy(self):
+        """Test case where all predictions are correct."""
+        import jax.numpy as jnp
+        
+        logits = jnp.array([[[5.0, 0.1, 0.2],   # argmax=0, target=0 ✓
+                             [0.1, 4.0, 0.3]],  # argmax=1, target=1 ✓
+                            [[0.2, 0.1, 3.0],   # argmax=2, target=2 ✓
+                             [2.0, 0.5, 0.1]]])# argmax=0, target=0 ✓
+        targets = jnp.array([[0, 1],
+                             [2, 0]])
+        
+        accuracy_sum, norm_factor = compute_weighted_accuracy(logits, targets)
+        
+        assert accuracy_sum == 4.0, f"Expected perfect accuracy (4/4), got {accuracy_sum}"
+        assert norm_factor == 4.0, f"Expected norm_factor=4.0, got {norm_factor}"
+    
+    def test_accuracy_with_weights(self):
+        """Test accuracy computation with weights/masking."""
+        import jax.numpy as jnp
+        
+        logits = jnp.array([[[2.0, 0.1, 0.5],   # argmax=0, target=0 ✓
+                             [0.2, 3.0, 0.1],   # argmax=1, target=1 ✓ (masked out)
+                             [0.1, 0.2, 4.0]],  # argmax=2, target=1 ✗
+                            [[1.5, 0.1, 0.3],   # argmax=0, target=2 ✗
+                             [0.1, 2.5, 0.2],   # argmax=1, target=1 ✓
+                             [3.0, 0.1, 0.5]]])# argmax=0, target=0 ✓
+        targets = jnp.array([[0, 1, 1],
+                             [2, 1, 0]])
+        
+        # Mask out second position of first sample
+        weights = jnp.array([[1.0, 0.0, 1.0],
+                             [1.0, 1.0, 1.0]])
+        
+        accuracy_sum, norm_factor = compute_weighted_accuracy(logits, targets, weights=weights)
+        
+        # Should count: sample1_pos1=✓, sample1_pos3=✗, sample2_pos1=✗, sample2_pos2=✓, sample2_pos3=✓
+        # Total: 3 correct out of 5 unmasked positions
+        assert accuracy_sum == 3.0, f"Expected 3 correct predictions, got {accuracy_sum}"
+        assert norm_factor == 5.0, f"Expected norm_factor=5.0 (weighted count), got {norm_factor}"
+    
+    def test_zero_accuracy(self):
+        """Test case where all predictions are wrong."""
+        import jax.numpy as jnp
+        
+        logits = jnp.array([[[0.1, 0.2, 3.0],   # argmax=2, target=0 ✗
+                             [2.0, 0.1, 0.3]],  # argmax=0, target=1 ✗
+                            [[0.5, 2.5, 0.1],   # argmax=1, target=2 ✗
+                             [0.2, 0.1, 1.5]]])# argmax=2, target=0 ✗
+        targets = jnp.array([[0, 1],
+                             [2, 0]])
+        
+        accuracy_sum, norm_factor = compute_weighted_accuracy(logits, targets)
+        
+        assert accuracy_sum == 0.0, f"Expected zero accuracy, got {accuracy_sum}"
+        assert norm_factor == 4.0, f"Expected norm_factor=4.0, got {norm_factor}"
 
 
 class TestIntegration:

@@ -4,8 +4,11 @@ This module provides functions for creating learning rate schedules commonly use
 in transformer training, including warmup and inverse square root decay schedules.
 """
 from typing import Callable
+import jax.numpy as jnp
 import optax
-
+from flax.training import common_utils
+from flax import nnx
+import numpy as np
 
 def rsqrt_schedule(init_value: float, shift: int = 0) -> Callable[[int], float]:
     """Create an inverse square root learning rate schedule.
@@ -66,3 +69,92 @@ def create_learning_rate_schedule(learning_rate: float, warmup_steps: int) -> Ca
         boundaries=[warmup_steps],
     )
 
+
+
+def compute_weighted_cross_entropy(
+  logits, targets, weights=None, label_smoothing=0.0
+):
+  """Compute weighted cross entropy and entropy for log probs and targets.
+
+  Args:
+   logits: [batch, length, num_classes] float array.
+   targets: categorical targets [batch, length] int array.
+   weights: None or array of shape [batch, length].
+   label_smoothing: label smoothing constant, used to determine the on and off
+     values.
+
+  Returns:
+    Tuple of scalar loss and batch normalizing factor.
+  """
+  if logits.ndim != targets.ndim + 1:
+    raise ValueError(
+      'Incorrect shapes. Got shape %s logits and %s targets'
+      % (str(logits.shape), str(targets.shape))
+    )
+  vocab_size = logits.shape[-1]
+  # Label smoothing: correct class gets 'confidence' prob, others get 'low_confidence'  
+  confidence = 1.0 - label_smoothing  # e.g., 0.9 for smoothing=0.1
+  low_confidence = (1.0 - confidence) / (vocab_size - 1)  # remaining prob split among wrong classes
+  
+  # Normalizing constant accounts for entropy added by label smoothing
+  normalizing_constant = -(
+    confidence * jnp.log(confidence)
+    + (vocab_size - 1) * low_confidence * jnp.log(low_confidence + 1e-20)
+  )
+  
+  # Create soft targets: [0.03, 0.9, 0.03, 0.03] instead of [0, 1, 0, 0]
+  soft_targets = common_utils.onehot(
+    targets, vocab_size, on_value=confidence, off_value=low_confidence
+  )
+
+  loss = -jnp.sum(soft_targets * nnx.log_softmax(logits), axis=-1)
+  loss = loss - normalizing_constant
+
+  normalizing_factor = np.prod(targets.shape)
+  if weights is not None:
+    loss = loss * weights
+    normalizing_factor = weights.sum()
+
+  return loss.sum(), normalizing_factor
+
+
+def compute_weighted_accuracy(logits, targets, weights=None):
+  """Compute weighted accuracy for log probs and targets.
+
+  Args:
+   logits: [batch, length, num_classes] float array.
+   targets: categorical targets [batch, length] int array.
+   weights: None or array of shape [batch, length]
+
+  Returns:
+    Tuple of scalar loss and batch normalizing factor.
+  """
+
+  if logits.ndim != targets.ndim + 1:
+    raise ValueError(
+      'Incorrect shapes. Got shape %s logits and %s targets'
+      % (str(logits.shape), str(targets.shape))
+    )
+  
+
+  # Compute accuracy: 1 for correct predictions, 0 for incorrect
+  accuracy = logits.argmax(axis=-1) == targets
+
+  normalizing_factor = np.prod(targets.shape)
+  if weights is not None:
+    accuracy = accuracy * weights
+    normalizing_factor = weights.sum()
+
+  return accuracy.sum(), normalizing_factor
+
+def compute_metrics(logits, labels, weights, label_smoothing=0.0):
+  """Compute summary metrics."""
+
+  loss, norm_factor = compute_weighted_cross_entropy(logits, labels, weights, label_smoothing)
+  accuracy_sum, _ = compute_weighted_accuracy(logits, labels, weights)
+
+  return {
+    'loss': loss,
+    'accuracy': accuracy_sum,
+    'norm_factor': norm_factor,
+  }
