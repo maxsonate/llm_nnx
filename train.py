@@ -5,10 +5,14 @@ in transformer training, including warmup and inverse square root decay schedule
 """
 from typing import Callable
 import jax.numpy as jnp
+import jax
 import optax
+import model
 from flax.training import common_utils
 from flax import nnx
 import numpy as np
+from utils import TrainState
+
 
 def rsqrt_schedule(init_value: float, shift: int = 0) -> Callable[[int], float]:
     """Create an inverse square root learning rate schedule.
@@ -158,3 +162,81 @@ def compute_metrics(logits, labels, weights, label_smoothing=0.0):
     'accuracy': accuracy_sum,
     'norm_factor': norm_factor,
   }
+
+
+def train_step(
+  state: TrainState,
+  batch,
+  learning_rate_fn,
+  label_smoothing=0.0,
+  dropout_rng=None,
+):
+  """Perform a single training step with gradient computation and state update.
+  
+  Args:
+    state: Current training state containing model parameters and optimizer state.
+    batch: Training batch containing input sequences and metadata.
+    learning_rate_fn: Function that returns learning rate for given step.
+    label_smoothing: Label smoothing factor for cross-entropy loss (0.0 = no smoothing).
+    dropout_rng: Random number generator key for dropout operations.
+    
+  Returns:
+    Tuple of (updated_state, metrics) where metrics contains loss, accuracy, and lr.
+  """
+  # Extract input sequences and position/segmentation info from batch
+  train_keys = ['inputs', 'inputs_position', 'inputs_segmentation']
+  inputs, input_positions, input_segmentation = (batch.get(k, None) for k in train_keys)
+
+  # Create attention mask: 1.0 for real tokens, 0.0 for padding tokens
+  weights = jnp.where(inputs > 0, 1.0, 0.0).astype(jnp.float32)
+
+  # Generate unique dropout RNG for this training step
+  dropout_rngs = jax.random.fold_in(dropout_rng, state.step)
+
+  def loss_fn(params):
+    """Compute loss and logits for given parameters."""
+    # Reconstruct model with current parameters
+    module = nnx.merge(state.graphdef, params)
+    module.set_attributes(deterministic=False, decode=False)
+
+    # Forward pass through model
+    logits = module(inputs, input_positions, input_segmentation, nnx.Rngs(dropout_rngs))
+
+    # Compute weighted cross-entropy loss
+    loss, weight_sum = compute_weighted_cross_entropy(logits, inputs, weights, label_smoothing)
+    mean_loss = loss / weight_sum
+    return mean_loss, logits
+  
+  # Get current learning rate for this step
+  step = state.step
+  lr = learning_rate_fn(step)
+  
+  # Compute gradients and loss simultaneously
+  grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+  (_, logits), grads = grad_fn(state.params)
+
+  # Apply gradients to update model parameters
+  new_state = state.apply_gradients(grads=grads)
+  
+  # Compute training metrics (loss, accuracy, etc.)
+  metrics = compute_metrics(logits, inputs, weights, label_smoothing)
+  metrics['learning_rate'] = lr
+
+  return new_state, metrics
+
+def eval_step(
+  params: nnx.State,
+  batch,
+  graphdef: nnx.GraphDef[model.TransformerLM],
+  label_smoothing=0.0,
+):
+   
+   inputs = batch['inputs']
+   weights = jnp.where(inputs > 0, 1.0, 0.0).astype(jnp.float32)
+
+   module = nnx.merge(graphdef, params)
+   module.set_attributes(deterministic=True, decode=False)
+
+   logits = module(inputs)
+   # This is assuming that inputs are not packed.
+   return compute_metrics(logits, inputs, weights, label_smoothing)

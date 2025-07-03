@@ -2,14 +2,20 @@
 
 import pytest
 import numpy as np
+import jax
+import jax.numpy as jnp
+from flax import nnx
+from unittest.mock import Mock, MagicMock
 
 # Import the functions directly - make sure this file is in the same directory as train.py
 try:
-    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy
+    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy, train_step
+    from utils import TrainState  # Assuming TrainState is in utils.py
 except ImportError:
     import sys
     sys.path.append('.')
-    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy
+    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy, train_step
+    from utils import TrainState
 
 
 class TestRsqrtSchedule:
@@ -305,6 +311,212 @@ class TestComputeWeightedAccuracy:
         
         assert accuracy_sum == 0.0, f"Expected zero accuracy, got {accuracy_sum}"
         assert norm_factor == 4.0, f"Expected norm_factor=4.0, got {norm_factor}"
+
+
+class TestTrainStep:
+    """Test cases for the train_step function."""
+    
+    def _create_mock_state(self, step=0):
+        """Create a mock TrainState for testing."""
+        # Mock parameters
+        mock_params = {'dense': jnp.array([[1.0, 2.0], [3.0, 4.0]])}
+        
+        # Mock graphdef
+        mock_graphdef = Mock()
+        
+        # Mock state
+        mock_state = Mock(spec=TrainState)
+        mock_state.params = mock_params
+        mock_state.graphdef = mock_graphdef
+        mock_state.step = step
+        
+        # Mock apply_gradients to return new state with incremented step
+        def mock_apply_gradients(grads):
+            new_state = Mock(spec=TrainState)
+            new_state.params = mock_params
+            new_state.graphdef = mock_graphdef
+            new_state.step = step + 1
+            new_state.apply_gradients = mock_apply_gradients
+            return new_state
+        
+        mock_state.apply_gradients = mock_apply_gradients
+        return mock_state
+    
+    def _create_mock_batch(self):
+        """Create a mock batch for testing."""
+        return {
+            'inputs': jnp.array([[1, 2, 3, 0], [4, 5, 0, 0]]),  # batch_size=2, seq_len=4
+            'inputs_position': jnp.array([[0, 1, 2, 3], [0, 1, 2, 3]]),
+            'inputs_segmentation': jnp.array([[1, 1, 1, 0], [1, 1, 0, 0]]),
+        }
+    
+    def _create_mock_module(self):
+        """Create a mock module that returns logits."""
+        mock_module = Mock()
+        # Return logits with shape [batch_size, seq_len, vocab_size]
+        mock_logits = jnp.array([[[1.0, 2.0, 0.5], [0.5, 1.5, 2.0], [2.0, 0.5, 1.0], [1.0, 1.0, 1.0]],
+                                [[0.5, 2.5, 1.0], [1.5, 0.5, 2.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]])
+        mock_module.return_value = mock_logits
+        mock_module.set_attributes = Mock()
+        return mock_module
+    
+    def test_basic_train_step(self):
+        """Test basic functionality of train_step."""
+        # Setup mocks
+        mock_state = self._create_mock_state(step=100)
+        mock_batch = self._create_mock_batch()
+        mock_learning_rate_fn = Mock(return_value=1e-4)
+        mock_module = self._create_mock_module()
+        
+        # Mock nnx.merge_params to return our mock module
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(nnx, 'merge', Mock(return_value=mock_module))
+            m.setattr(nnx, 'log_softmax', Mock(return_value=jnp.log(jnp.array([[[0.3, 0.6, 0.1], [0.2, 0.3, 0.5], [0.7, 0.2, 0.1], [0.33, 0.33, 0.34]],
+                                                                             [[0.1, 0.8, 0.1], [0.4, 0.1, 0.5], [0.33, 0.33, 0.34], [0.33, 0.33, 0.34]]]))))
+            
+            # Create dropout RNG
+            dropout_rng = jax.random.PRNGKey(42)
+            
+            # Call train_step
+            new_state, metrics = train_step(
+                state=mock_state,
+                batch=mock_batch,
+                learning_rate_fn=mock_learning_rate_fn,
+                label_smoothing=0.0,
+                dropout_rng=dropout_rng
+            )
+            
+            # Verify return types and structure
+            assert new_state is not None
+            assert isinstance(metrics, dict)
+            assert 'loss' in metrics
+            assert 'accuracy' in metrics
+            assert 'learning_rate' in metrics
+            assert 'norm_factor' in metrics
+            
+            # Verify learning rate was called with correct step
+            mock_learning_rate_fn.assert_called_once_with(100)
+            assert metrics['learning_rate'] == 1e-4
+            
+            # Verify state step was incremented
+            assert new_state.step == 101
+    
+    def test_train_step_with_label_smoothing(self):
+        """Test train_step with label smoothing enabled."""
+        # Setup mocks
+        mock_state = self._create_mock_state(step=50)
+        mock_batch = self._create_mock_batch()
+        mock_learning_rate_fn = Mock(return_value=2e-4)
+        mock_module = self._create_mock_module()
+        
+        # Mock nnx functions
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(nnx, 'merge', Mock(return_value=mock_module))
+            m.setattr(nnx, 'log_softmax', Mock(return_value=jnp.log(jnp.array([[[0.3, 0.6, 0.1], [0.2, 0.3, 0.5], [0.7, 0.2, 0.1], [0.33, 0.33, 0.34]],
+                                                                             [[0.1, 0.8, 0.1], [0.4, 0.1, 0.5], [0.33, 0.33, 0.34], [0.33, 0.33, 0.34]]]))))
+            
+            dropout_rng = jax.random.PRNGKey(123)
+            
+            # Call with label smoothing
+            new_state, metrics = train_step(
+                state=mock_state,
+                batch=mock_batch,
+                learning_rate_fn=mock_learning_rate_fn,
+                label_smoothing=0.1,
+                dropout_rng=dropout_rng
+            )
+            
+            # Verify smoothing was applied (should have different loss than no smoothing)
+            assert 'loss' in metrics
+            assert metrics['loss'] > 0
+            assert metrics['learning_rate'] == 2e-4
+            assert new_state.step == 51
+    
+    def test_train_step_gradient_computation(self):
+        """Test that gradients are computed and applied correctly."""
+        # Setup mocks
+        mock_state = self._create_mock_state(step=200)
+        mock_batch = self._create_mock_batch()
+        mock_learning_rate_fn = Mock(return_value=5e-4)
+        mock_module = self._create_mock_module()
+        
+        # Track calls to apply_gradients
+        apply_gradients_called = False
+        original_apply_gradients = mock_state.apply_gradients
+        
+        def track_apply_gradients(grads):
+            nonlocal apply_gradients_called
+            apply_gradients_called = True
+            # Verify grads is not None and has the right structure
+            assert grads is not None
+            assert isinstance(grads, dict)
+            return original_apply_gradients(grads)
+        
+        mock_state.apply_gradients = track_apply_gradients
+        
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(nnx, 'merge', Mock(return_value=mock_module))
+            m.setattr(nnx, 'log_softmax', Mock(return_value=jnp.log(jnp.array([[[0.3, 0.6, 0.1], [0.2, 0.3, 0.5], [0.7, 0.2, 0.1], [0.33, 0.33, 0.34]],
+                                                                             [[0.1, 0.8, 0.1], [0.4, 0.1, 0.5], [0.33, 0.33, 0.34], [0.33, 0.33, 0.34]]]))))
+            
+            dropout_rng = jax.random.PRNGKey(456)
+            
+            # Call train_step
+            new_state, metrics = train_step(
+                state=mock_state,
+                batch=mock_batch,
+                learning_rate_fn=mock_learning_rate_fn,
+                dropout_rng=dropout_rng
+            )
+            
+            # Verify gradients were computed and applied
+            assert apply_gradients_called, "apply_gradients should have been called"
+            assert new_state.step == 201
+            
+            # Verify module was configured correctly for training
+            mock_module.set_attributes.assert_called_once_with(deterministic=False, decode=False)
+    
+    def test_train_step_metrics_computation(self):
+        """Test that metrics are computed correctly."""
+        # Setup mocks
+        mock_state = self._create_mock_state(step=300)
+        mock_batch = self._create_mock_batch()
+        mock_learning_rate_fn = Mock(return_value=1e-3)
+        mock_module = self._create_mock_module()
+        
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(nnx, 'merge', Mock(return_value=mock_module))
+            m.setattr(nnx, 'log_softmax', Mock(return_value=jnp.log(jnp.array([[[0.3, 0.6, 0.1], [0.2, 0.3, 0.5], [0.7, 0.2, 0.1], [0.33, 0.33, 0.34]],
+                                                                             [[0.1, 0.8, 0.1], [0.4, 0.1, 0.5], [0.33, 0.33, 0.34], [0.33, 0.33, 0.34]]]))))
+            
+            dropout_rng = jax.random.PRNGKey(789)
+            
+            # Call train_step
+            new_state, metrics = train_step(
+                state=mock_state,
+                batch=mock_batch,
+                learning_rate_fn=mock_learning_rate_fn,
+                dropout_rng=dropout_rng
+            )
+            
+            # Verify metrics structure and content
+            required_metrics = ['loss', 'accuracy', 'norm_factor', 'learning_rate']
+            for metric in required_metrics:
+                assert metric in metrics, f"Missing metric: {metric}"
+                assert metrics[metric] is not None, f"Metric {metric} is None"
+            
+            # Verify learning rate matches
+            assert metrics['learning_rate'] == 1e-3
+            
+            # Verify loss and accuracy are reasonable
+            assert metrics['loss'] > 0, "Loss should be positive"
+            assert metrics['accuracy'] >= 0, "Accuracy should be non-negative"
+            assert metrics['norm_factor'] > 0, "Norm factor should be positive"
+            
+            # Verify norm_factor matches expected (sum of weights for non-padding tokens)
+            # From our mock batch: inputs = [[1, 2, 3, 0], [4, 5, 0, 0]]
+            # Non-zero positions: 3 + 2 = 5
+            assert metrics['norm_factor'] == 5.0, f"Expected norm_factor=5.0, got {metrics['norm_factor']}"
 
 
 class TestIntegration:
