@@ -4,6 +4,7 @@ This module provides functions for creating learning rate schedules commonly use
 in transformer training, including warmup and inverse square root decay schedules.
 """
 from typing import Callable
+import logging
 import jax.numpy as jnp
 import jax
 import optax
@@ -240,3 +241,48 @@ def eval_step(
    logits = module(inputs)
    # This is assuming that inputs are not packed.
    return compute_metrics(logits, inputs, weights, label_smoothing)
+  
+
+def evaluate(
+  *,
+  jit_eval_step,
+  state: TrainState,
+  eval_ds: "tf.data.Dataset",
+  num_eval_steps: int,
+):
+   """Evaluate the model on the given dataset.
+   
+   Args:
+     jit_eval_step: JIT-compiled evaluation step function.
+     state: Current training state with model parameters.
+     eval_ds: Evaluation dataset.
+     num_eval_steps: Number of evaluation steps to run.
+     
+   Returns:
+     Dictionary of averaged evaluation metrics.
+   """
+
+   logging.info("Starting evaluation...")
+
+   eval_metrics_list = []
+
+   eval_iter = iter(eval_ds) 
+
+   for _, eval_batch in zip(range(num_eval_steps), eval_iter):
+      # eval_batch = jax.tree.map(lambda x: x._numpy(), eval_batch) # TBD: Double check if this is correct, needed to revert to this after running the test.
+      eval_metrics = jit_eval_step(state.params, eval_batch, state.graphdef, label_smoothing=0.0)
+      eval_metrics_list.append(eval_metrics)
+
+   # Stack metrics from all evaluation steps
+   eval_metrics = common_utils.stack_forest(eval_metrics_list)
+   eval_metrics_sum = jax.tree.map(jnp.sum, eval_metrics)
+   
+   # Use norm_factor as denominator for averaging  
+   eval_denominator = eval_metrics_sum.pop('norm_factor')
+
+   # Calculate average metrics by dividing by total denominator
+   eval_summary = jax.tree.map(lambda x: x / eval_denominator, eval_metrics_sum)
+   
+   return eval_summary
+
+   

@@ -9,12 +9,12 @@ from unittest.mock import Mock, MagicMock
 
 # Import the functions directly - make sure this file is in the same directory as train.py
 try:
-    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy, train_step
+    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy, train_step, evaluate
     from utils import TrainState  # Assuming TrainState is in utils.py
 except ImportError:
     import sys
     sys.path.append('.')
-    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy, train_step
+    from train import rsqrt_schedule, create_learning_rate_schedule, compute_weighted_cross_entropy, compute_weighted_accuracy, train_step, evaluate
     from utils import TrainState
 
 
@@ -519,6 +519,43 @@ class TestTrainStep:
             assert metrics['norm_factor'] == 5.0, f"Expected norm_factor=5.0, got {metrics['norm_factor']}"
 
 
+class TestEvaluate:
+    """Test cases for the evaluate function."""
+    
+    def test_basic_evaluation(self):
+        """Test basic evaluation functionality."""
+        # Mock state and dataset
+        mock_state = Mock()
+        mock_state.params = {'dense': jnp.array([[1.0, 2.0]])}
+        mock_state.graphdef = Mock()
+        
+        # Mock dataset
+        mock_ds = Mock()
+        mock_ds.__iter__ = Mock(return_value=iter([
+            {'inputs': jnp.array([[1, 2, 0]])},
+            {'inputs': jnp.array([[3, 4, 5]])}
+        ]))
+        
+        # Mock jit_eval_step that returns metrics with denominator
+        def mock_jit_eval_step(params, batch, graphdef, label_smoothing=0.0):
+            return {
+                'loss': jnp.array(4.0),
+                'accuracy': jnp.array(2.0),
+                'norm_factor': jnp.array(1.0)
+            }
+        
+        result = evaluate(
+            jit_eval_step=mock_jit_eval_step,
+            state=mock_state,
+            eval_ds=mock_ds,
+            num_eval_steps=2
+        )
+        
+        # Should return dict with averaged metrics
+        assert isinstance(result, dict)
+        assert 'loss' in result
+        assert 'accuracy' in result
+    
 class TestIntegration:
     """Integration tests combining both functions."""
     
