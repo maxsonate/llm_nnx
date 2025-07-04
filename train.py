@@ -244,45 +244,68 @@ def eval_step(
   
 
 def evaluate(
-  *,
-  jit_eval_step,
-  state: TrainState,
-  eval_ds: "tf.data.Dataset",
-  num_eval_steps: int,
+    *,
+    jit_eval_step,
+    state: TrainState,
+    eval_ds: "tf.data.Dataset",
+    num_eval_steps: int,
+    label_smoothing: float = 0.0,
 ):
-   """Evaluate the model on the given dataset.
-   
-   Args:
-     jit_eval_step: JIT-compiled evaluation step function.
-     state: Current training state with model parameters.
-     eval_ds: Evaluation dataset.
-     num_eval_steps: Number of evaluation steps to run.
-     
-   Returns:
-     Dictionary of averaged evaluation metrics.
-   """
+    """Evaluate the model on the given dataset.
+    
+    Args:
+        jit_eval_step: JIT-compiled evaluation step function.
+        state: Current training state with model parameters.
+        eval_ds: Evaluation dataset.
+        num_eval_steps: Number of evaluation steps to run.
+        label_smoothing: Label smoothing factor for evaluation.
+        
+    Returns:
+        Dictionary of averaged evaluation metrics.
+    """
+    logging.info(f"Starting evaluation for {num_eval_steps} steps...")
+    
+    # Collect metrics from all evaluation batches
+    all_metrics = []
+    
+    for step, batch in enumerate(eval_ds):
+        if step >= num_eval_steps:
+            break
+            
+        # Convert batch to numpy if needed (handle both tensor types gracefully)
+        try:
+            if hasattr(batch, 'numpy'):
+                batch = jax.tree.map(lambda x: x.numpy(), batch)
+        except AttributeError:
+            # Batch is already in the correct format
+            pass
+            
+        # Evaluate single batch
+        batch_metrics = jit_eval_step(
+            state.params, batch, state.graphdef, label_smoothing=label_smoothing
+        )
+        all_metrics.append(batch_metrics)
+    
+    # Aggregate metrics across all batches
+    return _aggregate_metrics(all_metrics)
 
-   logging.info("Starting evaluation...")
 
-   eval_metrics_list = []
-
-   eval_iter = iter(eval_ds) 
-
-   for _, eval_batch in zip(range(num_eval_steps), eval_iter):
-      # eval_batch = jax.tree.map(lambda x: x._numpy(), eval_batch) # TBD: Double check if this is correct, needed to revert to this after running the test.
-      eval_metrics = jit_eval_step(state.params, eval_batch, state.graphdef, label_smoothing=0.0)
-      eval_metrics_list.append(eval_metrics)
-
-   # Stack metrics from all evaluation steps
-   eval_metrics = common_utils.stack_forest(eval_metrics_list)
-   eval_metrics_sum = jax.tree.map(jnp.sum, eval_metrics)
-   
-   # Use norm_factor as denominator for averaging  
-   eval_denominator = eval_metrics_sum.pop('norm_factor')
-
-   # Calculate average metrics by dividing by total denominator
-   eval_summary = jax.tree.map(lambda x: x / eval_denominator, eval_metrics_sum)
-   
-   return eval_summary
+def _aggregate_metrics(metrics_list):
+    """Aggregate metrics from multiple evaluation batches."""
+    if not metrics_list:
+        raise ValueError("No metrics to aggregate")
+    
+    # Stack and sum metrics across batches
+    stacked_metrics = common_utils.stack_forest(metrics_list)
+    summed_metrics = jax.tree.map(jnp.sum, stacked_metrics)
+    
+    # Extract normalization factor and compute averages
+    total_norm_factor = summed_metrics.pop('norm_factor')
+    averaged_metrics = jax.tree.map(
+        lambda x: x / total_norm_factor, summed_metrics
+    )
+    
+    logging.info(f"Evaluation completed. Total samples: {total_norm_factor}")
+    return averaged_metrics
 
    
