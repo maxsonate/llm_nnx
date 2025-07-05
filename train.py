@@ -13,6 +13,9 @@ from flax.training import common_utils
 from flax import nnx
 import numpy as np
 from utils import TrainState
+from configs import default
+import input_pipeline
+import os
 
 
 def rsqrt_schedule(init_value: float, shift: int = 0) -> Callable[[int], float]:
@@ -307,5 +310,31 @@ def _aggregate_metrics(metrics_list):
     
     logging.info(f"Evaluation completed. Total samples: {total_norm_factor}")
     return averaged_metrics
+
+
+def train_and_evaluate(config: default.Config, workdir: str):
+  """Runs a training and evaluation loop.
+
+  """
+
+  workdir = os.path.abspath(workdir)
+  os.makedirs(workdir, exist_ok=True)
+
+  vocab_path = config.vocab_path
+  if vocab_path is None:
+    vocab_path = os.path.join(workdir, 'sentencepiece_model')
+    config.vocab_path = vocab_path
+  os.makedirs(os.path.split(vocab_path)[0], exist_ok=True)
+
+  # Load Dataset
+  # ---------------------------------------------------------------------------
+  logging.info('Initializing dataset.')
+  train_ds, eval_ds, _, encoder = input_pipeline.get_datasets(
+    n_devices=jax.local_device_count(), config=config, vocab_path=vocab_path
+  )
+
+  train_iter = iter(train_ds)
+  vocab_size = int(encoder.vocab_size())
+
 
    
