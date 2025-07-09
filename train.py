@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jax
 import optax
 import model
+import modules
 from flax.training import common_utils
 from flax import nnx
 import numpy as np
@@ -16,6 +17,9 @@ from utils import TrainState
 from configs import default
 import input_pipeline
 import os
+import temperature_sampler
+import utils
+from jax.sharding import Mesh, NamedSharding
 
 
 def rsqrt_schedule(init_value: float, shift: int = 0) -> Callable[[int], float]:
@@ -336,5 +340,57 @@ def train_and_evaluate(config: default.Config, workdir: str):
   train_iter = iter(train_ds)
   vocab_size = int(encoder.vocab_size())
 
+  eos_id = temperature_sampler.EOS_ID  # Default Sentencepiece EOS token.
 
-   
+  def decode_tokens(toks):
+    valid_toks = toks[: np.argmax(toks == eos_id) + 1].astype(np.int32)
+    return encoder.detokenize(valid_toks).numpy().decode('utf-8')
+
+  def encode_strings(strs, max_len):
+    tokenized_batch = np.zeros((len(strs), max_len), np.int32)
+    for i, s in enumerate(strs):
+      toks = encoder.tokenize(s).numpy()
+      # Remove EOS token in prompt.
+      tokenized_batch[i, : toks.shape[0] - 1] = toks[:-1]
+    return tokenized_batch
+
+  tokenized_prompts = encode_strings(
+    [config.prompts], config.max_predict_length
+  )
+
+  logging.info('Initializing model, optimizer, and step functions.')
+  # Build Model and Optimizer
+ # ---------------------------------------------------------------------------
+  model_config = modules.TransformerConfig(
+    vocab_size=vocab_size,
+    output_vocab_size=vocab_size,
+    logits_via_embedding=config.logits_via_embedding,
+    dtype=jnp.bfloat16 if config.use_bfloat16 else jnp.float32,
+    emb_dim=config.emb_dim,
+    num_heads=config.num_heads,
+    num_layers=config.num_layers,
+    qkv_dim=config.qkv_dim,
+    mlp_dim=config.mlp_dim,
+    max_len=max(config.max_target_length, config.max_eval_target_length),
+    dropout_rate=config.dropout_rate,
+    attention_dropout_rate=config.attention_dropout_rate,
+    kernel_init=nnx.initializers.xavier_uniform(),
+    bias_init=nnx.initializers.normal(stddev=1e-6),
+    axis_rules=config.axis_rules,
+  )
+
+
+# Mesh definition
+  devices_array = utils.create_device_mesh(config)
+  mesh = Mesh(devices_array, config.mesh_axes)
+
+  start_step = 0
+  rng = jax.random.PRNGKey(config.seed)
+  rng, init_rng = jax.random.split(rng)
+  rng, inference_rng = jax.random.split(rng)
+
+  def constructor(config: modules.TransformerConfig, key: jax.Array):
+    return model.TransformerLM(config, rngs=nnx.Rngs(params=key))
+  
+  # TODO: add create mesh device to utils.
+  
