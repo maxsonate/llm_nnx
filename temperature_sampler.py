@@ -14,6 +14,7 @@
 
 """Fast decoding routines for inference from a trained language model."""
 
+import jax
 import jax.numpy as jnp
 from jax import lax, random
 
@@ -29,6 +30,7 @@ def temperature_sample(
   prng_key,
   temperature=1.0,
   topk=20,
+  topp=0.95,
   eos_token=EOS_ID,
 ):
   """Temperature sampling for language model generation.
@@ -43,6 +45,7 @@ def temperature_sample(
       zero this becomes equivalent to greedy sampling.
     topk: integer: if nonzero only use the top-k logits to sample next token,
       if zero don't use any cutoff and sample from full logits over vocabulary.
+    topp: float: if nonzero, use top-p sampling.
     eos_token: int: end-of-sentence token for target vocabulary.
 
   Returns:
@@ -85,7 +88,6 @@ def temperature_sample(
     # Call fast-decoder model on current tokens to get next-position logits.
     logits, new_cache = tokens_to_logits(cur_token, cache)
     # Sample next token from logits.
-    # TODO(levskaya): add top-p "nucleus" sampling option.
     if topk:
       # Get top-k logits and their indices, sample within these top-k tokens.
       topk_logits, topk_idxs = lax.top_k(logits, topk)
@@ -97,6 +99,23 @@ def temperature_sample(
       next_token = jnp.squeeze(
         jnp.take_along_axis(topk_idxs, topk_token, axis=-1), axis=-1
       )
+    elif topp:
+      probs = jax.nn.softmax(logits / temperature)
+      # Sort probabilities in descending order
+      sorted_idxs = jnp.argsort(-probs, axis=-1)
+      sorted_probs = jnp.take_along_axis(probs, sorted_idxs, axis=-1)
+      cumsum_probs = jnp.cumsum(sorted_probs, axis=-1)
+      # Create mask for tokens whose cumulative probability is <= topp
+      mask = cumsum_probs <= topp
+      # Include at least one token (the highest probability one)
+      mask = mask.at[..., 0].set(True)
+      # Zero out probabilities for tokens not in top-p
+      filtered_probs = jnp.where(mask, sorted_probs, 0.0)
+      # Sample from the filtered distribution
+      topp_token = random.categorical(rng1, jnp.log(filtered_probs + 1e-8))
+      # Map back to original token indices
+      next_token = jnp.take_along_axis(sorted_idxs, jnp.expand_dims(topp_token, axis=-1), axis=-1)
+      next_token = jnp.squeeze(next_token, axis=-1).astype(jnp.int32) 
     else:
       next_token = random.categorical(rng1, logits / temperature).astype(
         jnp.int32
