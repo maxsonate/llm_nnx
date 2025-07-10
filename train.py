@@ -392,5 +392,4 @@ def train_and_evaluate(config: default.Config, workdir: str):
   def constructor(config: modules.TransformerConfig, key: jax.Array):
     return model.TransformerLM(config, rngs=nnx.Rngs(params=key))
   
-  # TODO: add create mesh device to utils.
   
