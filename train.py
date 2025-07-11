@@ -10,7 +10,8 @@ import jax
 import optax
 import model
 import modules
-from flax.training import common_utils
+from clu import metric_writers
+from flax.training import common_utils, checkpoints
 from flax import nnx
 import numpy as np
 from utils import TrainState
@@ -19,7 +20,8 @@ import input_pipeline
 import os
 import temperature_sampler
 import utils
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+import dataclasses
 
 
 def rsqrt_schedule(init_value: float, shift: int = 0) -> Callable[[int], float]:
@@ -393,3 +395,66 @@ def train_and_evaluate(config: default.Config, workdir: str):
     return model.TransformerLM(config, rngs=nnx.Rngs(params=key))
   
   
+  learning_rate_fn = create_learning_rate_schedule(
+    learning_rate=config.learning_rate, warmup_steps=config.warmup_steps
+  )
+
+  optimizer = optax.adamw(
+    learning_rate_fn,
+    b1=0.9,
+    b2=0.98,
+    eps=1e-9,
+    weight_decay=config.weight_decay,
+  )
+
+  state, state_sharding = utils.setup_initial_state(
+    constructor, optimizer, model_config, init_rng, mesh
+  )
+  data_sharding = NamedSharding(mesh, P(config.data_sharding))
+
+
+  if config.restore_checkpoints:
+    # Restore unreplicated optimizer + model state from last checkpoint.
+    state = checkpoints.restore_checkpoint(workdir, state)
+    # Grab last step.
+    start_step = int(state.step)
+
+  writer = metric_writers.create_default_writer(
+    workdir, just_logging=jax.process_index() > 0
+  )
+  if start_step == 0:
+    writer.write_hparams(dataclasses.asdict(config))
+
+  # compile multidevice versions of train/eval/predict step fn.
+  jit_train_step = jax.jit( 
+    train_step,
+    in_shardings=(
+      state_sharding,
+      data_sharding,
+      None,
+    ),  # type: ignore
+    out_shardings=(state_sharding, None),  # type: ignore
+    static_argnames=("learning_rate_fn", "label_smoothing"),
+    donate_argnums=0,
+  )
+
+  jit_eval_step = jax.jit(
+    eval_step,
+    in_shardings=(
+      state_sharding.params,
+      data_sharding,
+    ),  # type: ignore
+    out_shardings=None,  # type: ignore
+    static_argnames=("graphdef", "label_smoothing"),
+  )
+
+# Main Train Loop
+  # ---------------------------------------------------------------------------
+
+  # We init the first set of dropout PRNG keys, but update it afterwards inside
+  # the main pmap"d training update for performance.
+  dropout_rngs = rng
+
+  logging.info('Starting training loop.')
+
+# TODO: Add training loop here
