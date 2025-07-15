@@ -10,7 +10,7 @@ import jax
 import optax
 import model
 import modules
-from clu import metric_writers
+from clu import metric_writers, periodic_actions
 from flax.training import common_utils, checkpoints
 from flax import nnx
 import numpy as np
@@ -457,4 +457,86 @@ def train_and_evaluate(config: default.Config, workdir: str):
 
   logging.info('Starting training loop.')
 
-# TODO: Add training loop here
+  hooks = []
+  report_progress = periodic_actions.ReportProgress(
+    num_train_steps=config.num_train_steps, writer=writer
+  )
+  if jax.process_index() == 0:
+    hooks += [
+      report_progress,
+      periodic_actions.Profile(logdir=workdir, num_profile_steps=5),
+    ]
+  train_metrics = []
+  with metric_writers.ensure_flushes(writer):
+    for step in range(start_step, config.num_train_steps):
+      is_last_step = step == config.num_train_steps - 1
+
+      # Shard data to devices and do a training step.
+      with jax.profiler.StepTraceAnnotation('train', step_num=step):
+        batch = next(train_iter)
+        batch = jax.tree.map(lambda x: jnp.asarray(x), batch)
+        state, metrics = jit_train_step(
+          state, batch, learning_rate_fn, config.label_smoothing, dropout_rngs
+        )
+        train_metrics.append(metrics)
+
+      # Quick indication that training is happening.
+      logging.log_first_n(logging.INFO, 'Finished training step %d.', 5, step)
+      for h in hooks:
+        h(step)
+
+
+      # Periodic metric handling.
+      if (step > 0 and step % config.eval_every_steps == 0) or is_last_step:
+        with report_progress.timed('training_metrics'):
+          logging.info('Gathering training metrics.')
+          train_metrics = common_utils.stack_forest(train_metrics)
+          lr = train_metrics.pop('learning_rate').mean()
+          metrics_sums = jax.tree.map(jnp.sum, train_metrics)
+          denominator = metrics_sums.pop('norm_factor')
+          summary = jax.tree.map(lambda x: x / denominator, metrics_sums)  # pylint: disable=cell-var-from-loop
+          summary['learning_rate'] = lr
+          summary['perplexity'] = jnp.clip(jnp.exp(summary['loss']), max=1.0e4)
+          summary = {'train_' + k: v for k, v in summary.items()}
+          writer.write_scalars(step, summary)
+          train_metrics = []
+
+        with report_progress.timed('eval'):
+          eval_results = evaluate(
+            jit_eval_step=jit_eval_step,
+            state=state,
+            eval_ds=eval_ds,
+            num_eval_steps=config.num_eval_steps,
+            label_smoothing=0.0,  # No label smoothing in evaluation
+          )
+          # (clipped) perplexity after averaging log-perplexitie
+          eval_results['perplexity'] = jnp.clip(
+            jnp.exp(eval_results['loss']), max=1.0e4
+          )
+          writer.write_scalars(
+            step, {'eval_' + k: v for k, v in eval_results.items()}
+          )
+
+        # TODO: Add generation step here
+        # with report_progress.timed('generate_text'):
+        #   exemplars = generate_prediction(
+        #     jit_pred_step=jit_pred_step,
+        #     graphdef=state.graphdef,
+        #     params=state.params,
+        #     tokenized_prompts=tokenized_prompts,
+        #     eos_id=eos_id,
+        #     inference_rng=inference_rng,
+        #     decode_tokens=decode_tokens,
+        #     config=config,
+        #     model_config=model_config,
+        #   )
+        #   writer.write_texts(step, {'samples': exemplars})
+
+      # Save a checkpoint on one host after every checkpoint_freq steps.
+      save_checkpoint = (
+        step % config.checkpoint_every_steps == 0 or is_last_step
+      )
+      if config.save_checkpoints and save_checkpoint:
+        logging.info('Saving checkpoint step %d.', step)
+        with report_progress.timed('checkpoint'):
+          checkpoints.save_checkpoint_multiprocess(workdir, state, step)
