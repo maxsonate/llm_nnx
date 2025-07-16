@@ -11,6 +11,7 @@ from model import TransformerLM, TransformerConfig
 
 class TrainState(train_state.TrainState):
     graphdef: nnx.GraphDef
+    non_diff_state: nnx.State  # For RNG states and other non-differentiable state
 
 
 
@@ -125,17 +126,17 @@ def setup_initial_state(
     # At this point, parameters have partition metadata but are NOT actually sharded
     model = constructor(config, rng)
     
-    # SHARDING: Split model into structure and parameters
-    # The sharding annotations stay with the parameters in the 'params' object
-    graphdef, params = nnx.split(model, nnx.Param)
+    # SHARDING: Split model into differentiable and non-differentiable state
+    graphdef, params, non_diff_state = nnx.split(model, nnx.Param, nnx.RngState)
     
     # SHARDING: Create training state - parameters are still replicated/on single device
     # TrainState.create() doesn't perform any sharding, just packages the data
     state = TrainState.create(
       apply_fn=graphdef.apply,
-      params=params,  # Contains sharding annotations but data is not sharded yet
+      params=params,  # Contains only differentiable parameters
       tx=tx,
       graphdef=graphdef,
+      non_diff_state=non_diff_state,  # Contains RNG states and other non-differentiable state
     )
     
     # SHARDING: Convert all data to JAX arrays (required for sharding operations)

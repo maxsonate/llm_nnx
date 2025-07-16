@@ -4,7 +4,7 @@ This module provides functions for creating learning rate schedules commonly use
 in transformer training, including warmup and inverse square root decay schedules.
 """
 from typing import Callable
-import logging
+from absl import logging
 import jax.numpy as jnp
 import jax
 import optax
@@ -43,12 +43,12 @@ def rsqrt_schedule(init_value: float, shift: int = 0) -> Callable[[int], float]:
     def schedule(step: int) -> float:
         if shift == 0:
             # Handle edge case where shift is 0 to avoid division by zero at step 0
-            effective_step = max(step, 1)
+            effective_step = jnp.maximum(step, 1)
             return init_value / (effective_step ** 0.5)
         else:
             # Standard rsqrt schedule: lr = init_value * sqrt(shift) / sqrt(step + shift)
             # Handle JAX evaluation where both branches of jnp.where get called
-            effective_step = max(step + shift, 1)
+            effective_step = jnp.maximum(step + shift, 1)
             return init_value * (shift ** 0.5) / (effective_step ** 0.5)
 
     return schedule
@@ -206,11 +206,11 @@ def train_step(
   def loss_fn(params):
     """Compute loss and logits for given parameters."""
     # Reconstruct model with current parameters
-    module = nnx.merge(state.graphdef, params)
+    module = nnx.merge(state.graphdef, params, state.non_diff_state)
     module.set_attributes(deterministic=False, decode=False)
 
     # Forward pass through model
-    logits = module(inputs, input_positions, input_segmentation, nnx.Rngs(dropout_rngs))
+    logits = module(inputs, inputs_positions=input_positions, inputs_segmentation=input_segmentation, rngs=nnx.Rngs(dropout_rngs))
 
     # Compute weighted cross-entropy loss
     loss, weight_sum = compute_weighted_cross_entropy(logits, inputs, weights, label_smoothing)
@@ -236,6 +236,7 @@ def train_step(
 
 def eval_step(
   params: nnx.State,
+  non_diff_state: nnx.State,
   batch,
   graphdef: nnx.GraphDef[model.TransformerLM],
   label_smoothing=0.0,
@@ -244,7 +245,7 @@ def eval_step(
    inputs = batch['inputs']
    weights = jnp.where(inputs > 0, 1.0, 0.0).astype(jnp.float32)
 
-   module = nnx.merge(graphdef, params)
+   module = nnx.merge(graphdef, params, non_diff_state)
    module.set_attributes(deterministic=True, decode=False)
 
    logits = module(inputs)
@@ -281,17 +282,12 @@ def evaluate(
         if step >= num_eval_steps:
             break
             
-        # Convert batch to numpy if needed (handle both tensor types gracefully)
-        try:
-            if hasattr(batch, 'numpy'):
-                batch = jax.tree.map(lambda x: x.numpy(), batch)
-        except AttributeError:
-            # Batch is already in the correct format
-            pass
+        # Convert TensorFlow tensors to JAX arrays (same as training loop)
+        batch = jax.tree.map(lambda x: jnp.asarray(x), batch)
             
         # Evaluate single batch
         batch_metrics = jit_eval_step(
-            state.params, batch, state.graphdef, label_smoothing=label_smoothing
+            state.params, state.non_diff_state, batch, state.graphdef, label_smoothing
         )
         all_metrics.append(batch_metrics)
     
@@ -442,6 +438,7 @@ def train_and_evaluate(config: default.Config, workdir: str):
     eval_step,
     in_shardings=(
       state_sharding.params,
+      state_sharding.non_diff_state,
       data_sharding,
     ),  # type: ignore
     out_shardings=None,  # type: ignore
@@ -487,6 +484,7 @@ def train_and_evaluate(config: default.Config, workdir: str):
 
 
       # Periodic metric handling.
+      print(f"step: {step}")
       if (step > 0 and step % config.eval_every_steps == 0) or is_last_step:
         with report_progress.timed('training_metrics'):
           logging.info('Gathering training metrics.')

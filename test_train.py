@@ -329,6 +329,7 @@ class TestTrainStep:
         mock_state.params = mock_params
         mock_state.graphdef = mock_graphdef
         mock_state.step = step
+        mock_state.non_diff_state = Mock()  # Mock non-differentiable state
         
         # Mock apply_gradients to return new state with incremented step
         def mock_apply_gradients(grads):
@@ -336,6 +337,7 @@ class TestTrainStep:
             new_state.params = mock_params
             new_state.graphdef = mock_graphdef
             new_state.step = step + 1
+            new_state.non_diff_state = Mock()  # Mock non-differentiable state
             new_state.apply_gradients = mock_apply_gradients
             return new_state
         
@@ -528,6 +530,7 @@ class TestEvaluate:
         mock_state = Mock()
         mock_state.params = {'dense': jnp.array([[1.0, 2.0]])}
         mock_state.graphdef = Mock()
+        mock_state.non_diff_state = Mock()  # Mock non-differentiable state
         
         # Mock dataset
         mock_ds = Mock()
