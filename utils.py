@@ -1,12 +1,13 @@
 from flax.training import train_state
 from flax import nnx
+from flax.core import FrozenDict
 import logging
 import jax
 import numpy as np
 from configs import default
 from jax.experimental import mesh_utils
 from jax import numpy as jnp
-from typing import Callable
+from typing import Callable, Any
 from model import TransformerLM, TransformerConfig
 
 class TrainState(train_state.TrainState):
@@ -156,3 +157,16 @@ def setup_initial_state(
   # that JAX can use for efficient distributed computation
   state_sharding = nnx.get_named_sharding(state, mesh)
   return state, state_sharding
+
+def count_parameters(params:FrozenDict[str, Any]) -> int:
+  """Count the number of parameters in a model."""
+  total_params = 0
+  param_breakdown = {}
+  flattened_params, _ = jax.tree.flatten_with_path(params)
+
+  for name, param in flattened_params:
+      param_count = param.size
+      total_params += param_count
+      param_breakdown[name] = param_count
+  
+  return total_params, param_breakdown

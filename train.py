@@ -444,7 +444,10 @@ def train_and_evaluate(config: default.Config, workdir: str):
     out_shardings=None,  # type: ignore
     static_argnames=("graphdef", "label_smoothing"),
   )
-
+# log total number of parameters:
+  
+  total_params, param_breakdown = utils.count_parameters(state.params)
+  logging.info(f"Total number of parameters: {total_params}")
 # Main Train Loop
   # ---------------------------------------------------------------------------
 
@@ -484,7 +487,6 @@ def train_and_evaluate(config: default.Config, workdir: str):
 
 
       # Periodic metric handling.
-      print(f"step: {step}")
       if (step > 0 and step % config.eval_every_steps == 0) or is_last_step:
         with report_progress.timed('training_metrics'):
           logging.info('Gathering training metrics.')
