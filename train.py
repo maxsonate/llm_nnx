@@ -231,6 +231,7 @@ def train_step(
   # Compute training metrics (loss, accuracy, etc.)
   metrics = compute_metrics(logits, inputs, weights, label_smoothing)
   metrics['learning_rate'] = lr
+  metrics['grads'] = jax.tree.map(lambda x: jnp.linalg.norm(x), grads)
 
   return new_state, metrics
 
@@ -496,6 +497,11 @@ def train_and_evaluate(config: default.Config, workdir: str):
           denominator = metrics_sums.pop('norm_factor')
           summary = jax.tree.map(lambda x: x / denominator, metrics_sums)  # pylint: disable=cell-var-from-loop
           summary['learning_rate'] = lr
+          flattened_grads, _ = jax.tree.flatten_with_path(summary.pop('grads'))
+          grad_summary = {f'grads/{".".join(k.key for k in keypath[:-1])}': float(grad_value) for keypath, grad_value in flattened_grads}
+          total_grad_norm = jnp.sqrt(jnp.sum(jnp.array([g**2 for _,g in flattened_grads])))
+          summary['grads/total_grad_norm'] = total_grad_norm
+          summary.update(grad_summary)
           summary['perplexity'] = jnp.clip(jnp.exp(summary['loss']), max=1.0e4)
           summary = {'train_' + k: v for k, v in summary.items()}
           writer.write_scalars(step, summary)
