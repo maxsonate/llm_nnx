@@ -83,6 +83,9 @@ class DataParallelConfig:
   ici_fsdp_parallelism: int = -1   # Auto-scale FSDP within slice  
   ici_tensor_parallelism: int = 1 # No tensor parallelism within slice
 
+  # Adaptive layer normalization
+  adaptive_layer_norm: bool = False
+
   def replace(self, **kwargs):
     return dataclasses.replace(self, **kwargs)
 

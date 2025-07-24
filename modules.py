@@ -484,6 +484,7 @@ class MultiHeadAttention(nnx.Module):
     dropout_rate: Dropout rate for attention weights.
     deterministic: Whether to use deterministic behavior.
     decode: Whether to enable autoregressive decoding.
+    adaptive_layer_norm: Whether to use adaptive layer normalization for query/key.
     rngs: Random number generators.
   """
 
@@ -510,6 +511,7 @@ class MultiHeadAttention(nnx.Module):
     decode: bool | None = None,
     normalize_qk: bool = False,
     rngs: nnx.Rngs,
+    adaptive_layer_norm: bool = False,
   ):
     self.num_heads = num_heads
     self.in_features = in_features
@@ -536,7 +538,7 @@ class MultiHeadAttention(nnx.Module):
     self.attention_fn = attention_fn
     self.decode = decode
     self.normalize_qk = normalize_qk
-
+    self.adaptive_layer_norm = adaptive_layer_norm
     
     # Combined QKV projection (more efficient than separate projections)
     assert in_features % num_heads == 0, "in_features must be divisible by num_heads"
@@ -567,19 +569,24 @@ class MultiHeadAttention(nnx.Module):
       rngs=rngs,
     )
 
+    if adaptive_layer_norm:
+      layernorm_cls = AdaptiveLayerNorm
+    else:
+      layernorm_cls = nnx.LayerNorm
+
     if normalize_qk:
-      self.query_ln = LayerNorm(num_features=head_dim,
+      self.query_ln = layernorm_cls(head_dim,
+                                  dtype=dtype,
+                                  param_dtype=param_dtype,
+                                  use_bias=False,
+                                  rngs=rngs,
+                                  )
+      self.key_ln = layernorm_cls(head_dim,
                                 dtype=dtype,
-                                param_dtype=param_dtype,
                                 use_bias=False,
+                                param_dtype=param_dtype,
                                 rngs=rngs,
                                 )
-      self.key_ln = LayerNorm(num_features=head_dim,
-                              dtype=dtype,
-                              use_bias=False,
-                              param_dtype=param_dtype,
-                              rngs=rngs,
-                              )
     else:
       self.query_ln = None
       self.key_ln = None
@@ -617,6 +624,7 @@ class MultiHeadAttention(nnx.Module):
     rngs: nnx.Rngs | None = None,
     sow_weights: bool = False,
     decode: bool | None = None,
+    condition: Array | None = None,
   ):
     """Apply multi-head attention.
     
@@ -631,6 +639,9 @@ class MultiHeadAttention(nnx.Module):
       rngs: Random number generators for dropout.
       sow_weights: Whether to store attention weights for debugging.
       decode: Whether to use autoregressive decoding.
+      condition: Conditioning input for adaptive layer normalization (if enabled).
+                 If None and adaptive_layer_norm=True, uses global sequence context 
+                 (mean pooling of inputs_q).
       
     Returns:
       Output tensor of shape (batch_size, seq_len, features).
@@ -670,8 +681,16 @@ class MultiHeadAttention(nnx.Module):
 
     if self.normalize_qk:
       # Apply layer normalization to query and key after projection
-      query = self.query_ln(query)
-      key = self.key_ln(key)
+      if self.adaptive_layer_norm:
+        # Auto-generate condition from global sequence context if not provided
+        if condition is None:
+          condition = jnp.mean(query, axis=1, keepdims=True)  # (batch, 1, features)
+
+        query = self.query_ln(query, condition=condition)
+        key = self.key_ln(key, condition=condition)
+      else:
+        query = self.query_ln(query)
+        key = self.key_ln(key)
 
 
     decode = first_from(decode,
@@ -828,7 +847,7 @@ class AdaptiveLayerNorm(nnx.Module):
       dim_condition, 
       dim, 
       use_bias=False, 
-      kernel_init=nnx.initializers.zeros_init(), 
+      kernel_init=nnx.initializers.xavier_uniform(), 
       rngs=rngs
     )
 
@@ -838,6 +857,7 @@ class AdaptiveLayerNorm(nnx.Module):
 
     normed = self.ln(x)
     gamma = self.to_gamma(condition)
+
     return normed * (gamma + 1.)
-  
-  # TBD: Add tests for AdaptiveLayerNorm.
+
+# TODO: Train a model with adaptive layer normalization

@@ -61,6 +61,7 @@ class EncoderDecoder1DBlock(nnx.Module):
       deterministic=_deterministic, # Set deterministic for MHA's internal dropout
       decode=decode, # Set decode flag for attention
       rngs=rngs,
+      adaptive_layer_norm=config.adaptive_layer_norm,
     )
     # Pass updated config to MlpBlock for its deterministic state
     mlp_config = config.replace(deterministic=_deterministic)

@@ -131,6 +131,9 @@ class Config:
   ici_fsdp_parallelism: int = -1
   ici_tensor_parallelism: int = 1
 
+  # Adaptive layer normalization
+  adaptive_layer_norm: bool = False
+
   def replace(self, **kwargs):
     return dataclasses.replace(self, **kwargs)
 

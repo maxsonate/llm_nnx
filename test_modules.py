@@ -551,6 +551,34 @@ class TestMultiHeadAttention(unittest.TestCase):
                 rngs=self.rngs_params
             )
 
+    def test_adaptive_layer_norm_feature(self):
+        """Test adaptive layer normalization feature."""
+        batch_size, seq_len, features, num_heads = 2, 4, 8, 2
+        inputs = jax.random.normal(jax.random.key(42), (batch_size, seq_len, features))
+        
+        # Test with auto-generated condition
+        attention_adaptive = MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=features,
+            normalize_qk=True,
+            adaptive_layer_norm=True,
+            dropout_rate=0.0,
+            deterministic=True,
+            rngs=self.rngs_params,
+            decode=False,
+        )
+        
+        output_auto = attention_adaptive(inputs, rngs=None)
+        self.assertEqual(output_auto.shape, inputs.shape)
+        
+        # Test with explicit condition
+        condition = jnp.ones((batch_size, 1, num_heads, features // num_heads))
+        output_explicit = attention_adaptive(inputs, condition=condition, rngs=None)
+        self.assertEqual(output_explicit.shape, inputs.shape)
+        
+        # Outputs should be different with different conditions
+        self.assertFalse(jnp.allclose(output_auto, output_explicit, atol=1e-6))
+
 class TestDotProductAttentionWeights(unittest.TestCase):
 
     def setUp(self):
