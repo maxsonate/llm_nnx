@@ -30,7 +30,7 @@ class DataParallelConfig:
   num_predict_steps: int = -1
   
   # Learning parameters - scaled for larger batch size
-  learning_rate: float = 0.008  # Was 0.0016, scaled 4x for 4x batch size
+  learning_rate: float = 0.01  # Was 0.0016, scaled 4x for 4x batch size
   warmup_steps: int = 1000
   label_smoothing: float = 0.0
   weight_decay: float = 0.1
@@ -54,7 +54,7 @@ class DataParallelConfig:
   save_checkpoints: bool = True
   restore_checkpoints: bool = True
   checkpoint_every_steps: int = 20_000  # Was 10_000, less frequent
-  eval_every_steps: int = 2_000  # Was 1_000, less frequent
+  eval_every_steps: int = 1_00  # Was 1_000, less frequent
   
   # Precision and optimization
   use_bfloat16: bool = True

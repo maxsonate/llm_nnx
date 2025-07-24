@@ -20,6 +20,7 @@ import numpy as np
 from flax.nnx.nn import dtypes
 from flax.nnx.nn.normalization import LayerNorm
 from flax.nnx.module import first_from
+from einops import rearrange, repeat, reduce, pack, unpack
 
 
 from configs import default
@@ -759,3 +760,84 @@ class MultiHeadAttention(nnx.Module):
     output = self.out_proj(attn)
 
     return output
+
+
+def default(value, x):
+  if value is None:
+    return x() if callable(x) else x
+  return value
+
+class AdaptiveLayerNorm(nnx.Module):
+  """Adaptive Layer Normalization.
+  
+  Applies layer normalization with learnable scaling conditioned on external input.
+  
+  Args:
+    dim: Dimension of the input features to be normalized.
+    dim_condition: Dimension of the conditioning input. If None, defaults to dim.
+    epsilon: Small value to avoid division by zero.
+    dtype: Computation dtype.
+    param_dtype: Parameter dtype.
+    use_bias: Whether to use bias in the underlying LayerNorm.
+    use_scale: Whether to use scale in the underlying LayerNorm.
+    bias_init: Bias initializer for LayerNorm.
+    scale_init: Scale initializer for LayerNorm.
+    reduction_axes: Axes for normalization statistics.
+    feature_axes: Feature axes for learned parameters.
+    axis_name: Axis name for parallel computation.
+    axis_index_groups: Groups for parallel computation.
+    use_fast_variance: Whether to use fast variance computation.
+    rngs: Random number generators for parameter initialization.
+  """
+  def __init__(self, 
+               dim, 
+               dim_condition=None, 
+               *,
+               epsilon: float = 1e-6,
+               dtype=None,
+               param_dtype=jnp.float32,
+               use_bias: bool = False,
+               use_scale: bool = False,
+               bias_init=nnx.initializers.zeros_init(),
+               scale_init=nnx.initializers.ones_init(),
+               reduction_axes: int = -1,
+               feature_axes: int = -1,
+               axis_name=None,
+               axis_index_groups=None,
+               use_fast_variance: bool = True,
+               rngs: nnx.Rngs):
+    dim_condition = default(dim_condition, dim)
+
+    self.ln = nnx.LayerNorm(
+      num_features=dim,
+      epsilon=epsilon,
+      dtype=dtype,
+      param_dtype=param_dtype,
+      use_bias=use_bias,
+      use_scale=use_scale,
+      bias_init=bias_init,
+      scale_init=scale_init,
+      reduction_axes=reduction_axes,
+      feature_axes=feature_axes,
+      axis_name=axis_name,
+      axis_index_groups=axis_index_groups,
+      use_fast_variance=use_fast_variance,
+      rngs=rngs
+    )
+    self.to_gamma = nnx.Linear(
+      dim_condition, 
+      dim, 
+      use_bias=False, 
+      kernel_init=nnx.initializers.zeros_init(), 
+      rngs=rngs
+    )
+
+  def __call__(self, x, *, condition):
+    if condition.ndim == 2:
+      condition = rearrange(condition, 'b d -> b 1 d')
+
+    normed = self.ln(x)
+    gamma = self.to_gamma(condition)
+    return normed * (gamma + 1.)
+  
+  # TBD: Add tests for AdaptiveLayerNorm.

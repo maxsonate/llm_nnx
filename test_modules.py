@@ -9,6 +9,7 @@ from modules import (
     shift_right, shift_inputs, sinusoidal_init, 
     TransformerConfig, AddPositionEmbs, MlpBlock, MultiHeadAttention, Shape,
     dot_product_attention_weights, dot_product_attention, combine_masks,
+    AdaptiveLayerNorm,
 )
 
 class TestModelFunctions(unittest.TestCase):
@@ -1030,6 +1031,39 @@ class TestDotProductAttention(unittest.TestCase):
         self.assertEqual(output_default.shape, output_high_precision.shape)
         # Values should be close but might not be exactly equal due to precision differences
         self.assertTrue(jnp.allclose(output_default, output_high_precision, rtol=1e-5))
+
+
+class TestAdaptiveLayerNorm(unittest.TestCase):
+    """Test the AdaptiveLayerNorm module."""
+
+    def setUp(self):
+        self.dim = 8
+        self.batch_size = 2
+        self.seq_len = 4
+        self.rngs = nnx.Rngs(params=jax.random.key(0))
+
+    def test_basic_adaptive_normalization(self):
+        """Test basic adaptive layer normalization functionality."""
+        x = jax.random.normal(jax.random.key(1), (self.batch_size, self.seq_len, self.dim))
+        condition = jax.random.normal(jax.random.key(2), (self.batch_size, self.seq_len, self.dim))
+        
+        aln = AdaptiveLayerNorm(self.dim, rngs=self.rngs)
+        output = aln(x, condition=condition)
+        
+        self.assertEqual(output.shape, x.shape)
+        self.assertFalse(jnp.allclose(output, x))  # Should be different due to normalization
+
+    def test_condition_reshaping(self):
+        """Test that 2D conditions are properly reshaped."""
+        x = jax.random.normal(jax.random.key(1), (self.batch_size, self.seq_len, self.dim))
+        condition_2d = jax.random.normal(jax.random.key(2), (self.batch_size, self.dim))
+        condition_3d = condition_2d[:, None, :]  # Manual reshape
+        
+        aln = AdaptiveLayerNorm(self.dim, rngs=self.rngs)
+        output_2d = aln(x, condition=condition_2d)
+        output_3d = aln(x, condition=condition_3d)
+        
+        np.testing.assert_allclose(np.array(output_2d), np.array(output_3d), rtol=1e-6)
 
 
 if __name__ == '__main__':
