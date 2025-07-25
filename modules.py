@@ -52,7 +52,8 @@ class TransformerConfig:
   axis_rules: default.MeshRules = dataclasses.field(
     default_factory=default.MeshRules
   )
-
+  adaptive_layer_norm: bool = False
+  normalize_qk: bool = False
   def replace(self, **kwargs):
     return dataclasses.replace(self, **kwargs)
 
@@ -859,5 +860,3 @@ class AdaptiveLayerNorm(nnx.Module):
     gamma = self.to_gamma(condition)
 
     return normed * (gamma + 1.)
-
-# TODO: Train a model with adaptive layer normalization

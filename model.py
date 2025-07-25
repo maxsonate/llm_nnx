@@ -62,6 +62,7 @@ class EncoderDecoder1DBlock(nnx.Module):
       decode=decode, # Set decode flag for attention
       rngs=rngs,
       adaptive_layer_norm=config.adaptive_layer_norm,
+      normalize_qk=config.normalize_qk,
     )
     # Pass updated config to MlpBlock for its deterministic state
     mlp_config = config.replace(deterministic=_deterministic)

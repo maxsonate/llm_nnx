@@ -376,6 +376,8 @@ def train_and_evaluate(config: default.Config, workdir: str):
     kernel_init=nnx.initializers.xavier_uniform(),
     bias_init=nnx.initializers.normal(stddev=1e-6),
     axis_rules=config.axis_rules,
+    adaptive_layer_norm=config.adaptive_layer_norm,
+    normalize_qk=config.normalize_qk,
   )
 
 
