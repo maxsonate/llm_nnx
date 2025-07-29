@@ -53,8 +53,8 @@ class DataParallelConfig:
   # Checkpointing and evaluation - adjusted for larger batches
   save_checkpoints: bool = True
   restore_checkpoints: bool = True
-  checkpoint_every_steps: int = 20_000  # Was 10_000, less frequent
-  eval_every_steps: int = 1_00  # Was 1_000, less frequent
+  checkpoint_every_steps: int = 1_000  # Was 10_000, less frequent
+  eval_every_steps: int = 1_000  # Was 1_000, less frequent
   
   # Precision and optimization
   use_bfloat16: bool = True

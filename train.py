@@ -274,7 +274,7 @@ def evaluate(
     Returns:
         Dictionary of averaged evaluation metrics.
     """
-    logging.info(f"Starting evaluation for {num_eval_steps} steps...")
+    logging.info(f"Starting evaluation for {num_eval_steps} batches at step {state.step}...")
     
     # Collect metrics from all evaluation batches
     all_metrics = []
@@ -413,10 +413,15 @@ def train_and_evaluate(config: default.Config, workdir: str):
 
 
   if config.restore_checkpoints:
-    # Restore unreplicated optimizer + model state from last checkpoint.
-    state = checkpoints.restore_checkpoint(workdir, state)
-    # Grab last step.
-    start_step = int(state.step)
+    # Restore without RNG states to avoid serialization bug
+    state_no_rng = state.replace(non_diff_state=None)
+    restored = checkpoints.restore_checkpoint(workdir, state_no_rng)
+    if hasattr(restored, 'step') and restored.step > 0:
+      # Keep original RNG states (they're unused during training)
+      state = restored.replace(non_diff_state=state.non_diff_state)
+      start_step = int(state.step)
+    else:
+      start_step = 0
 
   writer = metric_writers.create_default_writer(
     workdir, just_logging=jax.process_index() > 0
@@ -547,4 +552,7 @@ def train_and_evaluate(config: default.Config, workdir: str):
       if config.save_checkpoints and save_checkpoint:
         logging.info('Saving checkpoint step %d.', step)
         with report_progress.timed('checkpoint'):
-          checkpoints.save_checkpoint_multiprocess(workdir, state, step)
+          # Save state without RNG states to avoid serialization issues
+          # RNG states will be reinitialized from main RNG on restore
+          state_to_save = state.replace(non_diff_state=None)
+          checkpoints.save_checkpoint_multiprocess(workdir, state_to_save, step)
